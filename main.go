@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -16,8 +17,9 @@ import (
 
 func main() {
 	verbose := flag.Bool("v", false, "print the fully constructed conversation on every iteration")
+	debug := flag.Bool("debug", false, "wait for user input between iterations")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: hopper [-v] <programs-dir>")
+		fmt.Fprintln(os.Stderr, "usage: hopper [-v] [-debug] <programs-dir>")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -30,19 +32,20 @@ func main() {
 
 	client := anthropic.NewClient()
 
-	agent := NewAgent(&client, programsDir, DefaultTools, *verbose)
+	agent := NewAgent(&client, programsDir, DefaultTools(programsDir), *verbose, *debug)
 	err := agent.Run(context.TODO())
 	if err != nil {
 		fmt.Printf("Error: %s\n", err.Error())
 	}
 }
 
-func NewAgent(client *anthropic.Client, programsDir string, tools []ToolDefinition, verbose bool) *Agent {
+func NewAgent(client *anthropic.Client, programsDir string, tools []ToolDefinition, verbose, debug bool) *Agent {
 	return &Agent{
 		client:      client,
 		programsDir: programsDir,
 		tools:       tools,
 		verbose:     verbose,
+		debug:       debug,
 	}
 }
 
@@ -51,11 +54,13 @@ type Agent struct {
 	programsDir string
 	tools       []ToolDefinition
 	verbose     bool
+	debug       bool
 }
 
 func (a *Agent) Run(ctx context.Context) error {
 	var conversation []anthropic.MessageParam
 	rebuild := true
+	stdin := bufio.NewReader(os.Stdin)
 	for {
 		if rebuild {
 			c, err := a.buildConversation(ctx)
@@ -67,6 +72,17 @@ func (a *Agent) Run(ctx context.Context) error {
 
 		if a.verbose {
 			a.dumpConversation(conversation)
+		}
+
+		if a.debug {
+			fmt.Fprint(os.Stderr, "[debug] press enter to continue (q to quit): ")
+			line, err := stdin.ReadString('\n')
+			if err != nil {
+				return nil
+			}
+			if strings.TrimSpace(line) == "q" {
+				return nil
+			}
 		}
 
 		message, err := a.runInference(ctx, conversation)
