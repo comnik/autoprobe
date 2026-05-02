@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,30 +21,37 @@ func main() {
 
 	client := anthropic.NewClient()
 
-	agent := NewAgent(&client, programsDir)
+	agent := NewAgent(&client, programsDir, DefaultTools)
 	err := agent.Run(context.TODO())
 	if err != nil {
 		fmt.Printf("Error: %s\n", err.Error())
 	}
 }
 
-func NewAgent(client *anthropic.Client, programsDir string) *Agent {
+func NewAgent(client *anthropic.Client, programsDir string, tools []ToolDefinition) *Agent {
 	return &Agent{
 		client:      client,
 		programsDir: programsDir,
+		tools:       tools,
 	}
 }
 
 type Agent struct {
 	client      *anthropic.Client
 	programsDir string
+	tools       []ToolDefinition
 }
 
 func (a *Agent) Run(ctx context.Context) error {
+	var conversation []anthropic.MessageParam
+	rebuild := true
 	for {
-		conversation, err := a.buildConversation(ctx)
-		if err != nil {
-			return err
+		if rebuild {
+			c, err := a.buildConversation(ctx)
+			if err != nil {
+				return err
+			}
+			conversation = c
 		}
 
 		message, err := a.runInference(ctx, conversation)
@@ -51,20 +59,47 @@ func (a *Agent) Run(ctx context.Context) error {
 			return err
 		}
 
-		toolUses := 0
+		toolResults := []anthropic.ContentBlockParamUnion{}
 		for _, content := range message.Content {
 			switch content.Type {
 			case "text":
 				fmt.Printf("\u001b[93mClaude\u001b[0m: %s\n", content.Text)
 			case "tool_use":
-				toolUses++
+				result := a.executeTool(content.ID, content.Name, content.Input)
+				toolResults = append(toolResults, result)
 			}
 		}
 
-		if toolUses == 0 {
+		if len(toolResults) == 0 {
 			return nil
 		}
+
+		rebuild = false
+		conversation = append(conversation, message.ToParam())
+		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
 	}
+}
+
+func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
+	var toolDef ToolDefinition
+	var found bool
+	for _, tool := range a.tools {
+		if tool.Name == name {
+			toolDef = tool
+			found = true
+			break
+		}
+	}
+	if !found {
+		return anthropic.NewToolResultBlock(id, "tool not found", true)
+	}
+
+	fmt.Printf("\u001b[92mtool\u001b[0m: %s(%s)\n", name, input)
+	response, err := toolDef.Function(input)
+	if err != nil {
+		return anthropic.NewToolResultBlock(id, err.Error(), true)
+	}
+	return anthropic.NewToolResultBlock(id, response, false)
 }
 
 func (a *Agent) buildConversation(ctx context.Context) ([]anthropic.MessageParam, error) {
@@ -103,10 +138,16 @@ func (a *Agent) buildConversation(ctx context.Context) ([]anthropic.MessageParam
 }
 
 func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
+	tools := make([]anthropic.ToolUnionParam, len(a.tools))
+	for i, t := range a.tools {
+		tools[i] = t.AsParam()
+	}
+
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.ModelClaudeSonnet4_6,
 		MaxTokens: int64(1024),
 		Messages:  conversation,
+		Tools:     tools,
 	})
 	return message, err
 }
