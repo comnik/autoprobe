@@ -65,19 +65,47 @@ func cmdInit(args []string) error {
 		path = cmd.Arg(0)
 	}
 
-	if entries, err := os.ReadDir(path); err == nil {
-		if len(entries) > 0 {
-			return fmt.Errorf("%s already exists and is not empty", path)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	info, err := os.Stat(path)
+	exists := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	update := false
+	if exists {
+		if !info.IsDir() {
+			return fmt.Errorf("%s exists but is not a directory", path)
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		if len(entries) > 0 {
+			if !looksLikeHopperDir(path) {
+				return fmt.Errorf("%s already exists and does not look like a hopper directory (expected programs/ and reinforcement/ subdirs)", path)
+			}
+			update = true
+		}
 	}
 
 	if err := extractAssets(path); err != nil {
 		return err
 	}
-	fmt.Printf("initialized hopper directory at %s\n", path)
+	if update {
+		fmt.Printf("updated hopper directory at %s\n", path)
+	} else {
+		fmt.Printf("initialized hopper directory at %s\n", path)
+	}
 	return nil
+}
+
+func looksLikeHopperDir(path string) bool {
+	for _, sub := range []string{"programs", "reinforcement"} {
+		info, err := os.Stat(filepath.Join(path, sub))
+		if err != nil || !info.IsDir() {
+			return false
+		}
+	}
+	return true
 }
 
 func cmdRun(args []string) error {
