@@ -14,7 +14,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
-func NewAgent(client *anthropic.Client, root string, verbose, debug bool) *Agent {
+func NewAgent(client *anthropic.Client, root, goal string, verbose, debug bool) *Agent {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
@@ -24,6 +24,7 @@ func NewAgent(client *anthropic.Client, root string, verbose, debug bool) *Agent
 		client:           client,
 		programsDir:      programsDir,
 		reinforcementDir: reinforcementDir,
+		goal:             goal,
 		tools:            DefaultTools,
 		verbose:          verbose,
 		debug:            debug,
@@ -42,6 +43,7 @@ type Agent struct {
 	client           *anthropic.Client
 	programsDir      string
 	reinforcementDir string
+	goal             string
 	tools            []ToolDefinition
 	verbose          bool
 	debug            bool
@@ -78,6 +80,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		message, err := a.runInference(ctx, conversation)
 		if err != nil {
 			return err
+		}
+		if message.StopReason == anthropic.StopReasonMaxTokens {
+			return fmt.Errorf("response hit the max_tokens limit; bump the budget in runInference")
 		}
 
 		toolResults := []anthropic.ContentBlockParamUnion{}
@@ -171,9 +176,12 @@ func (a *Agent) buildConversation(ctx context.Context) ([]anthropic.MessageParam
 		outputs[i] = out
 	}
 
-	blocks := make([]anthropic.ContentBlockParamUnion, 0, len(outputs))
+	blocks := make([]anthropic.ContentBlockParamUnion, 0, len(outputs)+1)
 	for _, out := range outputs {
 		blocks = append(blocks, anthropic.NewTextBlock(string(out)))
+	}
+	if a.goal != "" {
+		blocks = append(blocks, anthropic.NewTextBlock(a.goal))
 	}
 
 	return []anthropic.MessageParam{anthropic.NewUserMessage(blocks...)}, nil
@@ -187,7 +195,7 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.ModelClaudeOpus4_7,
-		MaxTokens: int64(1024),
+		MaxTokens: 8192,
 		Messages:  conversation,
 		Tools:     tools,
 	})
