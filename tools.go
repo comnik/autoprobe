@@ -2,11 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -29,9 +27,7 @@ func (t ToolDefinition) AsParam() anthropic.ToolUnionParam {
 	}
 }
 
-func DefaultTools(programsDir string) []ToolDefinition {
-	return []ToolDefinition{ReadTool, BashTool, EditTool, NewWriteTool(programsDir)}
-}
+var DefaultTools = []ToolDefinition{ReadTool, BashTool, EditTool, WriteTool}
 
 var ReadTool = ToolDefinition{
 	Name:        "read",
@@ -142,58 +138,35 @@ func editFile(input json.RawMessage) (string, error) {
 	return "ok", nil
 }
 
-func NewWriteTool(programsDir string) ToolDefinition {
-	return ToolDefinition{
-		Name:        "write",
-		Description: "Create a new file or overwrite an existing file with the given content. The path must be inside the configured programs directory.",
-		InputSchema: anthropic.ToolInputSchemaParam{
-			Properties: map[string]any{
-				"path": map[string]any{
-					"type":        "string",
-					"description": "Path to the file to write. Must be inside the configured programs directory.",
-				},
-				"content": map[string]any{
-					"type":        "string",
-					"description": "Content to write to the file.",
-				},
+var WriteTool = ToolDefinition{
+	Name:        "write",
+	Description: "Create a new file or overwrite an existing file with the given content.",
+	InputSchema: anthropic.ToolInputSchemaParam{
+		Properties: map[string]any{
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Path to the file to write.",
 			},
-			Required: []string{"path", "content"},
+			"content": map[string]any{
+				"type":        "string",
+				"description": "Content to write to the file.",
+			},
 		},
-		Function: writeFile(programsDir),
-	}
+		Required: []string{"path", "content"},
+	},
+	Function: writeFile,
 }
 
-func writeFile(programsDir string) func(json.RawMessage) (string, error) {
-	return func(input json.RawMessage) (string, error) {
-		var args struct {
-			Path    string `json:"path"`
-			Content string `json:"content"`
-		}
-		if err := json.Unmarshal(input, &args); err != nil {
-			return "", err
-		}
-		if !pathInside(programsDir, args.Path) {
-			return "", errors.New("rejected: path is outside the configured programs directory")
-		}
-		if err := os.WriteFile(args.Path, []byte(args.Content), 0644); err != nil {
-			return "", err
-		}
-		return "ok", nil
+func writeFile(input json.RawMessage) (string, error) {
+	var args struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
 	}
-}
-
-func pathInside(dir, path string) bool {
-	absDir, err := filepath.Abs(dir)
-	if err != nil {
-		return false
+	if err := json.Unmarshal(input, &args); err != nil {
+		return "", err
 	}
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return false
+	if err := os.WriteFile(args.Path, []byte(args.Content), 0644); err != nil {
+		return "", err
 	}
-	rel, err := filepath.Rel(absDir, absPath)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	return "ok", nil
 }

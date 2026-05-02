@@ -24,7 +24,7 @@ func NewAgent(client *anthropic.Client, root string, verbose, debug bool) *Agent
 		client:           client,
 		programsDir:      programsDir,
 		reinforcementDir: reinforcementDir,
-		tools:            DefaultTools(programsDir),
+		tools:            DefaultTools,
 		verbose:          verbose,
 		debug:            debug,
 	}
