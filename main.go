@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,26 +14,34 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: hopper <programs-dir>")
+	verbose := flag.Bool("v", false, "print the fully constructed conversation on every iteration")
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: hopper [-v] <programs-dir>")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		flag.Usage()
 		os.Exit(1)
 	}
-	programsDir := os.Args[1]
+	programsDir := flag.Arg(0)
 
 	client := anthropic.NewClient()
 
-	agent := NewAgent(&client, programsDir, DefaultTools)
+	agent := NewAgent(&client, programsDir, DefaultTools, *verbose)
 	err := agent.Run(context.TODO())
 	if err != nil {
 		fmt.Printf("Error: %s\n", err.Error())
 	}
 }
 
-func NewAgent(client *anthropic.Client, programsDir string, tools []ToolDefinition) *Agent {
+func NewAgent(client *anthropic.Client, programsDir string, tools []ToolDefinition, verbose bool) *Agent {
 	return &Agent{
 		client:      client,
 		programsDir: programsDir,
 		tools:       tools,
+		verbose:     verbose,
 	}
 }
 
@@ -40,6 +49,7 @@ type Agent struct {
 	client      *anthropic.Client
 	programsDir string
 	tools       []ToolDefinition
+	verbose     bool
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -52,6 +62,10 @@ func (a *Agent) Run(ctx context.Context) error {
 				return err
 			}
 			conversation = c
+		}
+
+		if a.verbose {
+			a.dumpConversation(conversation)
 		}
 
 		message, err := a.runInference(ctx, conversation)
@@ -78,6 +92,15 @@ func (a *Agent) Run(ctx context.Context) error {
 		conversation = append(conversation, message.ToParam())
 		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
 	}
+}
+
+func (a *Agent) dumpConversation(conversation []anthropic.MessageParam) {
+	data, err := json.MarshalIndent(conversation, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dumpConversation: %s\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "--- conversation (%d messages) ---\n%s\n--- end ---\n", len(conversation), data)
 }
 
 func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
