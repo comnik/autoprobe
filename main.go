@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -119,10 +120,22 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 
 	fmt.Printf("\u001b[92mtool\u001b[0m: %s(%s)\n", name, input)
 	response, err := toolDef.Function(input)
-	if err != nil {
-		return anthropic.NewToolResultBlock(id, err.Error(), true)
+	isError := err != nil
+	if isError {
+		response = err.Error()
 	}
-	return anthropic.NewToolResultBlock(id, response, false)
+	if r := readReinforcement(name); r != "" {
+		response = response + "\n\n" + r
+	}
+	return anthropic.NewToolResultBlock(id, response, isError)
+}
+
+func readReinforcement(name string) string {
+	data, err := os.ReadFile(filepath.Join("reinforcement", name+".md"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func (a *Agent) buildConversation(ctx context.Context) ([]anthropic.MessageParam, error) {
