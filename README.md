@@ -51,14 +51,18 @@ of the dependency graph.
 
 At the core of `hopper` is an agent loop like any other. Where it differs is in the
 representation of the context. Instead of modeling context as a conversation interspersed
-with tool calls, context in `hopper` is a library of installed programs.
+with tool calls, context in `hopper` is constructed by a library of installed programs.
+Currently the library is just a directory in the local filesystem. Files in that directory
+are assumed to be executable. In each iteration, the harness executes every installed
+program and appends the output to the context for that model call.
 
-In each iteration, each installed program has a certain probability of getting called. When
-it does, it contributes its output to the context for that iteration.
+Select programs in the library are considered *cornerstones*, which cannot be deleted or
+otherwise modified by the agent. Usually at least one cornerstone is used to set the overall
+goal to work towards.
 
-Select programs in the library are considered *cornerstones*. These cannot be deleted or
-otherwise modified by the agent and they always get called with probability 1.0.
+To be clear, `hopper` can still perform regular tool calls. The difference is really just
+that in each iteration, the context passed to the LLM is constructed entirely from scratch.
+Established tools like `read`, `write`, `edit`, and `bash` are also how the agent is
+expected to update the library.
 
-To be clear, `hopper` can still perform regular tool calls. In fact it comes with some
-additional tools for modifying the library. Its just that in each iteration, the context
-passed to the LLM is constructed entirely from scratch.
+Execution continues until the model no longer returns any tool calls.
