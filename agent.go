@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -169,11 +170,18 @@ func (a *Agent) buildConversation(ctx context.Context) ([]anthropic.MessageParam
 	outputs := make([][]byte, len(names))
 	for i, name := range names {
 		path := filepath.Join(a.programsDir, name)
-		out, err := exec.CommandContext(ctx, path).Output()
-		if err != nil {
-			return nil, fmt.Errorf("running %s: %w", name, err)
+		out, runErr := exec.CommandContext(ctx, path).CombinedOutput()
+
+		var exitErr *exec.ExitError
+		if runErr != nil && !errors.As(runErr, &exitErr) {
+			return nil, fmt.Errorf("running %s: %w", name, runErr)
 		}
-		outputs[i] = out
+		exitCode := 0
+		if exitErr != nil {
+			exitCode = exitErr.ExitCode()
+		}
+		header := fmt.Sprintf("[program=%s exit=%d]\n", name, exitCode)
+		outputs[i] = append([]byte(header), out...)
 	}
 
 	blocks := make([]anthropic.ContentBlockParamUnion, 0, len(outputs)+1)
