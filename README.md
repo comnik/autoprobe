@@ -66,3 +66,11 @@ Established tools like `read`, `write`, `edit`, and `bash` are also how the agen
 expected to update the library.
 
 Execution continues until the model no longer returns any tool calls.
+
+## FAQ
+
+**Q: How is this different from having an agent write skills or tools?**
+
+The installed programs are automatically executed on every iteration and so have a chance to
+feed information from the environment to the agent pro-actively. Skills also hard-code the
+progressive disclosure mechanism, whereas hopper can evolve its own.
