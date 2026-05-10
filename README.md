@@ -1,7 +1,16 @@
 # autoprobe
 
-Experimental agent harness with the goal of exploring a shift from passive memory to
-*programmatic context*.
+Experimental agent harness where context is constructed by executable programs that
+constantly probe the environment. Like any other codebase, these programs are written and
+evolved by the agent entirely on its own, or in collaboration with human users. This active
+*programmatic context* then becomes an alternative to passive memory systems based on static
+files.
+
+**Objectives**
+
+1. 10x fewer in-context tokens without loss of quality or time taken to complete a task.
+2. Reusable abstractions that persist across sessions.
+3. Fine-grained grounding and steering by human users.
 
 ## Motivation
 
@@ -16,8 +25,14 @@ assumption suddenly clashes with reality. The challenge is to find a balance, wh
 generated programs continuously validate their core assumptions against ground truth and
 escalate back to the agent if any assumption is violated.
 
-`autoprobe` is a goal-seeking agent harness that encourages continuous program synthesis in
-order to minimize token usage without sacrificing intelligence.
+If a traditional agent needs to know whether all tests are passing, or whether a server is
+up, it may read thousands of tokens of logs, or rely on stale information from the
+conversation history. Wrapped in `autoprobe`, an agent should write a script that checks and
+outputs `SERVER_STATUS: UP` or `10/10 tests passing`.
+
+I wanted a goal-seeking agent harness that encourages program synthesis combined with
+continuous probing of the environment, in order to minimize token usage without sacrificing
+intelligence.
 
 ### The memory lens
 
@@ -29,47 +44,57 @@ But like any form of documentation, static knowledge bases can drift from realit
 the challenge is to continuously test the encoded knowledge against a ground truth, but to
 do so *out of context*.
 
-Luckily, a markdown "memory" is just a program that happens to only be executable
-in-context. Nothing prevents an intelligent agent from encoding its hard earned knowledge
-about the environment it is operating in (say a codebase) in a program that is executable
-out of context. This is the difference between documenting the layout of a codebase and
-calling `ls` or `grep`.
+A markdown "memory" is just a program that happens to only be executable in-context. Nothing
+prevents an intelligent agent from encoding its hard earned knowledge about the environment
+it is operating in (say a codebase) in a program that is executable out of context. This is
+the difference between documenting the layout of a codebase in a `.md` vs calling `ls` or
+`grep`. Both have different strenghts and weaknesses. The `.md` compresses the knowledge but
+can drift. Calling `ls` and `grep` always reflects ground truth, but can cause lots of
+redundant information to spill into the context window.
 
-The key is to encourage the agent to write its "memory programs" in such a way that they
-encode and validate their assumptions. For example, knowledge about a specific component in
-a codebase should come with a check that ensures that the component still exists at the
-expected location. Knowledge about the architecture of the codebase should come with a check
-of the dependency graph.
+So the key is to encourage the agent to write its "memory programs" in such a way that when
+executed, they return a compressed representation of the knowledge, but also validate their
+underlying assumptions against the current state of the environment. For example, knowledge
+about a specific component in a codebase should come with a check that ensures that the
+component still exists at the expected location. Knowledge about the architecture of the
+codebase should come with a check of the dependency graph.
 
-## Objectives
+### Why `autoprobe`?
 
-1. 10x fewer in-context tokens without loss of quality or time taken to complete a task.
-2. No more compaction.
-3. Abstractions that persist across sessions.
+Instead of an agent that writes a diary of what it did, `autoprobe` agents install probes in
+the environment they are operating in. The context window becomes a live dashboard of
+sensors that is always a fresh, verified reflection of reality.
 
 ## Architecture
 
-At the core of `autoprobe` is an agent loop like any other. Where it differs is in the
+At the core of `autoprobe` is [an agent loop like any
+other](https://ampcode.com/notes/how-to-build-an-agent). Where it differs is in the
 representation of the context. Instead of modeling context as a conversation interspersed
 with tool calls, the `autoprobe` harness constructs the context from scratch on every
-iteration, by assembling the outputs of a library of installed programs. The library is just
-a directory in the local filesystem. Files in that directory are assumed to be executable.
-In each iteration, the harness executes every installed program and appends the output to
-the context for that model call.
+iteration, by assembling the outputs of a library of installed programs. Spend cheap
+out-of-context compute freely, in order to improve the signal-to-noise ratio of the context
+window.
 
-`autoprobe init` pre-installs a *cornerstone* program which explains the approach.
+The library is just a directory in the local filesystem. Files in that directory are assumed
+to be executable. In each iteration, the harness executes every installed program and
+appends the output to the context for that model call.
+
+`autoprobe init` sets up the library (`.autoprobe/programs` by default) and pre-installs a
+*cornerstone* program which explains the approach.
 
 Human users can contribute their own programs to the library, or edit those created by the
 agent. Typically, at least one human-provided program is used to set (and verify!) the
 overall goal to work towards. For simple goals, this can be specified inline via the
 `autoprobe run --goal ...` argument.
 
-To be clear, `autoprobe` can still perform regular tool calls. The difference is really just
+To be clear: `autoprobe` can still perform regular tool calls. The difference is really just
 that in each iteration, the context passed to the LLM is constructed entirely from scratch.
 Established tools like `read`, `write`, `edit`, and `bash` are also how the agent is
 expected to update the library.
 
 Execution continues until the model no longer returns any tool calls.
+
+![Workflow](workflow.png)
 
 ## FAQ
 
@@ -77,4 +102,15 @@ Execution continues until the model no longer returns any tool calls.
 
 The installed programs are automatically executed on every iteration and so have a chance to
 feed information from the environment to the agent pro-actively. Skills also hard-code the
-progressive disclosure mechanism, whereas autoprobe can evolve its own.
+progressive disclosure mechanism, whereas with `autoprobe` the agent can evolve its own.
+
+**Q: Can I use `autoprobe` with my favourite model?**
+
+Not yet. The current implementation is a minimal proof-of-concept hard-coded to use Claude.
+
+**Q: Can I use `autoprobe` with my favourite coding harness?**
+
+No, the `autoprobe` interaction model can't be tacked on to a conventional harness via
+plugin / skill. However programmatic context is a simple idea and easy to implement, so open
+source harnesses like the great [pi](https://github.com/earendil-works/pi) could easily be
+forked and adapted.
