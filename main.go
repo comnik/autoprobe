@@ -110,13 +110,11 @@ func looksLikeHopperDir(path string) bool {
 
 func cmdRun(args []string) error {
 	cmd := flag.NewFlagSet("run", flag.ExitOnError)
-	verbose := cmd.Bool("v", false, "print the fully constructed conversation on every iteration")
 	debug := cmd.Bool("debug", false, "wait for user input between iterations")
 	goal := cmd.String("goal", "", "inline goal statement appended to the conversation as the last program output")
 	cmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: hopper run [-v] [--debug] [--goal <text>] [path]")
+		fmt.Fprintln(os.Stderr, "usage: hopper run [--debug] [--goal <text>] [path]")
 		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "  -v             print the fully constructed conversation on every iteration")
 		fmt.Fprintln(os.Stderr, "  --debug        wait for user input between iterations")
 		fmt.Fprintln(os.Stderr, "  --goal <text>  inline goal statement appended to the conversation as the last program output")
 	}
@@ -134,7 +132,7 @@ func cmdRun(args []string) error {
 	}
 
 	client := anthropic.NewClient()
-	agent := NewAgent(&client, path, *goal, *verbose, *debug)
+	agent := NewAgent(&client, path, *goal, *debug)
 	return agent.Run(context.TODO())
 }
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,7 +14,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
-func NewAgent(client *anthropic.Client, root, goal string, verbose, debug bool) *Agent {
+func NewAgent(client *anthropic.Client, root, goal string, debug bool) *Agent {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
@@ -27,7 +26,6 @@ func NewAgent(client *anthropic.Client, root, goal string, verbose, debug bool) 
 		reinforcementDir: reinforcementDir,
 		goal:             goal,
 		tools:            DefaultTools,
-		verbose:          verbose,
 		debug:            debug,
 	}
 }
@@ -46,74 +44,56 @@ type Agent struct {
 	reinforcementDir string
 	goal             string
 	tools            []ToolDefinition
-	verbose          bool
 	debug            bool
+
+	conversation []anthropic.MessageParam
+	iteration    int
 }
+
+func (a *Agent) Conversation() []anthropic.MessageParam { return a.conversation }
+func (a *Agent) Iteration() int                         { return a.iteration }
+func (a *Agent) StepThrough() bool                      { return a.debug }
 
 func (a *Agent) Run(ctx context.Context) error {
-	var conversation []anthropic.MessageParam
-	rebuild := true
-	stdin := bufio.NewReader(os.Stdin)
-	for {
-		if rebuild {
-			c, err := a.buildConversation(ctx)
-			if err != nil {
-				return err
-			}
-			conversation = c
-		}
-
-		if a.verbose {
-			a.dumpConversation(conversation)
-		}
-
-		if a.debug {
-			fmt.Fprint(os.Stderr, "[debug] press enter to continue (q to quit): ")
-			line, err := stdin.ReadString('\n')
-			if err != nil {
-				return nil
-			}
-			if strings.TrimSpace(line) == "q" {
-				return nil
-			}
-		}
-
-		message, err := a.runInference(ctx, conversation)
-		if err != nil {
-			return err
-		}
-		if message.StopReason == anthropic.StopReasonMaxTokens {
-			return fmt.Errorf("response hit the max_tokens limit; bump the budget in runInference")
-		}
-
-		toolResults := []anthropic.ContentBlockParamUnion{}
-		for _, content := range message.Content {
-			switch content.Type {
-			case "text":
-				fmt.Printf("[93mClaude[0m: %s\n", content.Text)
-			case "tool_use":
-				result := a.executeTool(content.ID, content.Name, content.Input)
-				toolResults = append(toolResults, result)
-			}
-		}
-
-		if len(toolResults) == 0 {
-			return nil
-		}
-
-		rebuild = false
-		conversation = append(conversation, message.ToParam())
-		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
-	}
+	return runTUI(ctx, a)
 }
 
-func (a *Agent) dumpConversation(conversation []anthropic.MessageParam) {
-	data, err := json.MarshalIndent(conversation, "", "  ")
+// Prime builds the initial conversation. Must be called once before Step.
+func (a *Agent) Prime(ctx context.Context) error {
+	c, err := a.buildConversation(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "dumpConversation: %s\n", err)
-		return
+		return err
 	}
-	fmt.Fprintf(os.Stderr, "--- conversation (%d messages) ---\n%s\n--- end ---\n", len(conversation), data)
+	a.conversation = c
+	return nil
+}
+
+// Step runs a single inference + tool execution iteration. Returns the
+// assistant message produced and whether the agent has finished (no further
+// tool calls).
+func (a *Agent) Step(ctx context.Context) (*anthropic.Message, bool, error) {
+	message, err := a.runInference(ctx, a.conversation)
+	if err != nil {
+		return nil, false, err
+	}
+	if message.StopReason == anthropic.StopReasonMaxTokens {
+		return message, false, fmt.Errorf("response hit the max_tokens limit; bump the budget in runInference")
+	}
+	a.iteration++
+	a.conversation = append(a.conversation, message.ToParam())
+
+	toolResults := []anthropic.ContentBlockParamUnion{}
+	for _, content := range message.Content {
+		if content.Type == "tool_use" {
+			result := a.executeTool(content.ID, content.Name, content.Input)
+			toolResults = append(toolResults, result)
+		}
+	}
+	if len(toolResults) == 0 {
+		return message, true, nil
+	}
+	a.conversation = append(a.conversation, anthropic.NewUserMessage(toolResults...))
+	return message, false, nil
 }
 
 func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
@@ -130,7 +110,6 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 		return anthropic.NewToolResultBlock(id, "tool not found", true)
 	}
 
-	fmt.Printf("[92mtool[0m: %s(%s)\n", name, input)
 	response, err := toolDef.Function(input)
 	isError := err != nil
 	if isError {
@@ -189,7 +168,7 @@ func (a *Agent) buildConversation(ctx context.Context) ([]anthropic.MessageParam
 		blocks = append(blocks, anthropic.NewTextBlock(string(out)))
 	}
 	if a.goal != "" {
-		blocks = append(blocks, anthropic.NewTextBlock(a.goal))
+		blocks = append(blocks, anthropic.NewTextBlock("[YOUR GOAL]\n"+a.goal))
 	}
 
 	return []anthropic.MessageParam{anthropic.NewUserMessage(blocks...)}, nil
