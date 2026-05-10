@@ -11,7 +11,7 @@ import (
 
 // providerChoice is one row in the provider picker.
 type providerChoice struct {
-	id    string // "anthropic" | "openai" | "google"
+	id    string // "anthropic" | "openai" | "google" | "grok"
 	label string
 	hint  string
 }
@@ -20,6 +20,7 @@ var providerChoices = []providerChoice{
 	{id: "anthropic", label: "Anthropic", hint: "Claude (uses ANTHROPIC_API_KEY)"},
 	{id: "openai", label: "OpenAI", hint: "GPT / Codex (uses OPENAI_API_KEY)"},
 	{id: "google", label: "Google", hint: "Gemini (uses GEMINI_API_KEY or GOOGLE_API_KEY)"},
+	{id: "grok", label: "Grok (xAI)", hint: "Grok (uses XAI_API_KEY)"},
 }
 
 // modelChoice is one row in the model picker.
@@ -53,6 +54,13 @@ func suggestedModels(provider string) []modelChoice {
 			{id: "", label: "(provider default)", hint: "let autoprobe pick"},
 			{id: "gemini-2.5-pro", label: "Gemini 2.5 Pro"},
 			{id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "fastest"},
+		}
+	case "grok":
+		return []modelChoice{
+			{id: "", label: "(provider default)", hint: "let autoprobe pick"},
+			{id: "grok-4", label: "grok-4", hint: "most capable"},
+			{id: "grok-4-fast-reasoning", label: "grok-4-fast-reasoning"},
+			{id: "grok-code-fast-1", label: "grok-code-fast-1", hint: "code-focused"},
 		}
 	}
 	return []modelChoice{{id: "", label: "(provider default)"}}

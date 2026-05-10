@@ -57,12 +57,12 @@ func usage() {
 
 func cmdInit(args []string) error {
 	cmd := flag.NewFlagSet("init", flag.ExitOnError)
-	providerName := cmd.String("provider", "anthropic", "LLM provider: anthropic | openai | google")
+	providerName := cmd.String("provider", "anthropic", "LLM provider: anthropic | openai | google | grok")
 	model := cmd.String("model", "", "model id (provider-specific; empty means use the provider's default)")
 	cmd.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: autoprobe init [--provider <name>] [--model <id>] [path]")
 		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "  --provider     anthropic (default), openai, or google")
+		fmt.Fprintln(os.Stderr, "  --provider     anthropic (default), openai, google, or grok")
 		fmt.Fprintln(os.Stderr, "  --model        model id; empty uses the provider's default")
 	}
 	cmd.Parse(args)
@@ -73,7 +73,7 @@ func cmdInit(args []string) error {
 	cmd.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
 	if !validProvider(*providerName) {
-		return fmt.Errorf("unknown provider %q (expected anthropic, openai, or google)", *providerName)
+		return fmt.Errorf("unknown provider %q (expected anthropic, openai, google, or grok)", *providerName)
 	}
 
 	path := defaultProbeDir
@@ -133,7 +133,7 @@ func cmdInit(args []string) error {
 		cfg = picked
 	}
 	if !validProvider(cfg.Provider) {
-		return fmt.Errorf("unknown provider %q (expected anthropic, openai, or google)", cfg.Provider)
+		return fmt.Errorf("unknown provider %q (expected anthropic, openai, google, or grok)", cfg.Provider)
 	}
 
 	if err := WriteConfig(path, cfg); err != nil {
@@ -154,7 +154,7 @@ func cmdInit(args []string) error {
 
 func validProvider(name string) bool {
 	switch name {
-	case "anthropic", "openai", "google":
+	case "anthropic", "openai", "google", "grok":
 		return true
 	}
 	return false
@@ -217,8 +217,10 @@ func buildProvider(name, model string) (Provider, error) {
 		return NewOpenAIProvider(model), nil
 	case "google":
 		return NewGoogleProvider(model)
+	case "grok":
+		return NewGrokProvider(model), nil
 	default:
-		return nil, fmt.Errorf("unknown provider %q (expected anthropic, openai, or google)", name)
+		return nil, fmt.Errorf("unknown provider %q (expected anthropic, openai, google, or grok)", name)
 	}
 }
 

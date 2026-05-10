@@ -104,8 +104,8 @@ Initialize an `autoprobe` directory in your project:
 autoprobe init
 ```
 
-This launches an interactive picker for the model provider (Anthropic, OpenAI, or Google)
-and a specific model, then creates `.autoprobe/`:
+This launches an interactive picker for the model provider (Anthropic, OpenAI, Google, or
+xAI Grok) and a specific model, then creates `.autoprobe/`:
 
 - `config.yaml` — the chosen provider and model
 - `programs/` — the cornerstone program plus anything you or the agent install
@@ -127,6 +127,7 @@ Set the appropriate API key for your chosen provider:
 - Anthropic: `ANTHROPIC_API_KEY`
 - OpenAI: `OPENAI_API_KEY`
 - Google: `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+- Grok (xAI): `XAI_API_KEY`
 
 Then run the agent:
 
@@ -146,10 +147,12 @@ progressive disclosure mechanism, whereas with `autoprobe` the agent can evolve 
 
 **Q: Can I use `autoprobe` with my favourite model?**
 
-`autoprobe` supports Anthropic Claude, OpenAI (including Codex), and Google Gemini.
-Pick one when running `autoprobe init` (or pass `--provider` and `--model` to skip
-the picker). Reasoning / thinking content round-trips across turns for all three
-providers, so multi-turn tool use works the same way regardless of which you choose.
+`autoprobe` supports Anthropic Claude, OpenAI (including Codex), Google Gemini, and
+xAI Grok. Pick one when running `autoprobe init` (or pass `--provider` and `--model`
+to skip the picker). Reasoning / thinking content round-trips across turns for the
+first three providers; xAI does not return a replayable reasoning signature, so Grok
+runs without thinking continuity (the agent loop tolerates this). Tool calling works
+the same way regardless of which provider you choose.
 
 **Q: Can I use `autoprobe` with my favourite coding harness?**
 
