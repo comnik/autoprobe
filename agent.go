@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +11,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+)
+
+const (
+	idleBackoffInitial = 1 * time.Second
+	idleBackoffMax     = 30 * time.Second
 )
 
 func NewAgent(provider Provider, root, goal string, debug bool) *Agent {
@@ -45,6 +53,15 @@ type Agent struct {
 
 	conversation []Message
 	iteration    int
+
+	// Carried across Steps: lastStopReason controls whether the prior
+	// assistant/tool history is preserved (tool-using cycle) or thrown away
+	// (cycle ended on StopEnd). lastSent is the conversation we last handed
+	// to the provider — when the freshly reconstructed conversation matches
+	// it byte-for-byte, the next Step idles instead of re-querying the model.
+	lastStopReason StopReason
+	lastSent       []Message
+	idleBackoff    time.Duration
 }
 
 func (a *Agent) Conversation() []Message { return a.conversation }
@@ -66,10 +83,40 @@ func (a *Agent) Prime(ctx context.Context) error {
 	return nil
 }
 
-// Step runs a single inference + tool execution iteration. Returns the
-// assistant message produced and whether the agent has finished (no further
-// tool calls).
+// Step runs a single inference + tool execution iteration. The conversation
+// is reconstructed at the start of every Step by re-running the programs;
+// assistant/tool history from prior Steps is preserved only while the model
+// is mid tool-using cycle (StopToolUse). When the reconstructed conversation
+// matches the previous one byte-for-byte (programs produced identical output
+// and there's no new history), the Step idles with exponential backoff
+// rather than re-querying the model. The agent never auto-terminates —
+// done is always false on success.
 func (a *Agent) Step(ctx context.Context) (AssistantMessage, bool, error) {
+	for {
+		var history []Message
+		if a.lastStopReason == StopToolUse && len(a.conversation) > 1 {
+			history = append(history, a.conversation[1:]...)
+		}
+		fresh, err := a.buildConversation(ctx)
+		if err != nil {
+			return AssistantMessage{}, false, err
+		}
+		a.conversation = append(fresh, history...)
+
+		if !conversationsEqual(a.conversation, a.lastSent) {
+			a.idleBackoff = 0
+			break
+		}
+
+		d := a.nextIdleBackoff()
+		select {
+		case <-time.After(d):
+			continue
+		case <-ctx.Done():
+			return AssistantMessage{}, false, ctx.Err()
+		}
+	}
+
 	c := Context{
 		Messages: a.conversation,
 		Tools:    a.tools,
@@ -85,19 +132,46 @@ func (a *Agent) Step(ctx context.Context) (AssistantMessage, bool, error) {
 		return msg, false, fmt.Errorf("provider error: %s", msg.Err)
 	}
 	a.iteration++
+	a.lastSent = a.conversation
+	a.lastStopReason = msg.StopReason
 	a.conversation = append(a.conversation, msg)
 
-	var results []Message
 	for _, c := range msg.Content {
 		if call, ok := c.(ToolCall); ok {
-			results = append(results, a.executeTool(call))
+			a.conversation = append(a.conversation, a.executeTool(call))
 		}
 	}
-	if len(results) == 0 {
-		return msg, true, nil
-	}
-	a.conversation = append(a.conversation, results...)
 	return msg, false, nil
+}
+
+func (a *Agent) nextIdleBackoff() time.Duration {
+	if a.idleBackoff == 0 {
+		a.idleBackoff = idleBackoffInitial
+	} else {
+		a.idleBackoff *= 2
+		if a.idleBackoff > idleBackoffMax {
+			a.idleBackoff = idleBackoffMax
+		}
+	}
+	return a.idleBackoff
+}
+
+func conversationsEqual(a, b []Message) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	ja, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	jb, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(ja, jb)
 }
 
 func (a *Agent) executeTool(call ToolCall) ToolResultMessage {

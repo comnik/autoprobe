@@ -92,7 +92,14 @@ that in each iteration, the context passed to the LLM is constructed entirely fr
 Established tools like `read`, `write`, `edit`, and `bash` are also how the agent is
 expected to update the library.
 
-Execution continues until the model no longer returns any tool calls.
+Each iteration re-runs the programs and rebuilds the user-side context from scratch.
+Assistant messages and tool results are retained only while the model is mid tool-using
+cycle; once it produces a response with no tool calls the cycle ends and the next
+iteration starts fresh with just the new program outputs. When the reconstructed
+context matches the previous one byte-for-byte (programs produced identical output
+and nothing new has happened), the harness idles with exponential backoff (capped at
+30s) instead of re-querying the model. The agent never auto-terminates; quit with `q`
+in the TUI.
 
 ![Workflow](workflow.png)
 
