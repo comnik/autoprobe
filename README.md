@@ -36,6 +36,8 @@ intelligence.
 
 ### The memory lens
 
+> From `.md` to `.sh`.
+
 Another way to think about `autoprobe` is as a memory system for agents that is based on
 executable programs, rather than static files.
 
@@ -59,8 +61,6 @@ about a specific component in a codebase should come with a check that ensures t
 component still exists at the expected location. Knowledge about the architecture of the
 codebase should come with a check of the dependency graph.
 
-### Why `autoprobe`?
-
 Instead of an agent that writes a diary of what it did, `autoprobe` agents install probes in
 the environment they are operating in. The context window becomes a live dashboard of
 sensors that is always a fresh, verified reflection of reality.
@@ -71,9 +71,9 @@ At the core of `autoprobe` is [an agent loop like any
 other](https://ampcode.com/notes/how-to-build-an-agent). Where it differs is in the
 representation of the context. Instead of modeling context as a conversation interspersed
 with tool calls, the `autoprobe` harness constructs the context from scratch on every
-iteration, by assembling the outputs of a library of installed programs. Spend cheap
-out-of-context compute freely, in order to improve the signal-to-noise ratio of the context
-window.
+iteration, by assembling the outputs of a library of installed programs. It is worth it to
+spend cheap out-of-context compute in order to improve the signal-to-noise ratio of the
+context window.
 
 The library is just a directory in the local filesystem. Files in that directory are assumed
 to be executable. In each iteration, the harness executes every installed program and
