@@ -251,7 +251,7 @@ var (
 
 func (m pickerModel) View() string {
 	var b strings.Builder
-	b.WriteString(pickerTitleStyle.Render("autoprobe init"))
+	b.WriteString(pickerTitleStyle.Render("autoprobe v" + Version + " · init"))
 	b.WriteString("\n\n")
 
 	switch m.step {

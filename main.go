@@ -29,6 +29,9 @@ func main() {
 		err = cmdInit(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Println("autoprobe", Version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -43,11 +46,13 @@ func main() {
 }
 
 func usage() {
+	fmt.Fprintf(os.Stderr, "autoprobe %s\n\n", Version)
 	fmt.Fprintln(os.Stderr, "usage: autoprobe <command> [arguments]")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  init [--provider <p>] [--model <m>] [path]   create an autoprobe directory (default: .autoprobe)")
 	fmt.Fprintln(os.Stderr, "  run  [path]                                  run the agent against an autoprobe directory (default: .autoprobe)")
+	fmt.Fprintln(os.Stderr, "  version                                      print the autoprobe version")
 }
 
 func cmdInit(args []string) error {

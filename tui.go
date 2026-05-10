@@ -413,7 +413,7 @@ var (
 )
 
 func (m tuiModel) renderHeader() string {
-	title := headerTitleStyle.Render("autoprobe")
+	title := headerTitleStyle.Render("autoprobe v" + Version)
 	info := fmt.Sprintf("iteration %d  •  %s  •  %s", m.agent.Iteration(), m.agent.Provider().Name(), m.stateLabel())
 	style := headerInfoStyle
 	if m.state == stateError {
