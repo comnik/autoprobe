@@ -1,4 +1,4 @@
-module github.com/comnik/hopper
+module github.com/comnik/autoprobe
 
 go 1.25.0
 

@@ -1,7 +1,7 @@
-# hopper
+# autoprobe
 
-Minimal and highly experimental agent harness with the goal of exploring *programmatic
-context*.
+Experimental agent harness with the goal of exploring a shift from passive memory to
+*programmatic context*.
 
 ## Motivation
 
@@ -16,12 +16,12 @@ assumption suddenly clashes with reality. The challenge is to find a balance, wh
 generated programs continuously validate their core assumptions against ground truth and
 escalate back to the agent if any assumption is violated.
 
-`hopper` is a goal-seeking agent effectively doing continuous program synthesis in order to
-minimize token usage without sacrificing intelligence.
+`autoprobe` is a goal-seeking agent harness that encourages continuous program synthesis in
+order to minimize token usage without sacrificing intelligence.
 
 ### The memory lens
 
-Another way to think about `hopper` is as a memory system for agents that is based on
+Another way to think about `autoprobe` is as a memory system for agents that is based on
 executable programs, rather than static files.
 
 Most memory systems rely on static markdown files to build up a persistent knowledge base.
@@ -33,7 +33,7 @@ Luckily, a markdown "memory" is just a program that happens to only be executabl
 in-context. Nothing prevents an intelligent agent from encoding its hard earned knowledge
 about the environment it is operating in (say a codebase) in a program that is executable
 out of context. This is the difference between documenting the layout of a codebase and
-calling `ls` and `grep`.
+calling `ls` or `grep`.
 
 The key is to encourage the agent to write its "memory programs" in such a way that they
 encode and validate their assumptions. For example, knowledge about a specific component in
@@ -49,18 +49,22 @@ of the dependency graph.
 
 ## Architecture
 
-At the core of `hopper` is an agent loop like any other. Where it differs is in the
+At the core of `autoprobe` is an agent loop like any other. Where it differs is in the
 representation of the context. Instead of modeling context as a conversation interspersed
-with tool calls, context in `hopper` is constructed by a library of installed programs.
-Currently the library is just a directory in the local filesystem. Files in that directory
-are assumed to be executable. In each iteration, the harness executes every installed
-program and appends the output to the context for that model call.
+with tool calls, the `autoprobe` harness constructs the context from scratch on every
+iteration, by assembling the outputs of a library of installed programs. The library is just
+a directory in the local filesystem. Files in that directory are assumed to be executable.
+In each iteration, the harness executes every installed program and appends the output to
+the context for that model call.
 
-Select programs in the library are considered *cornerstones*, which cannot be deleted or
-otherwise modified by the agent. Usually at least one cornerstone is used to set the overall
-goal to work towards.
+`autoprobe init` pre-installs a *cornerstone* program which explains the approach.
 
-To be clear, `hopper` can still perform regular tool calls. The difference is really just
+Human users can contribute their own programs to the library, or edit those created by the
+agent. Typically, at least one human-provided program is used to set (and verify!) the
+overall goal to work towards. For simple goals, this can be specified inline via the
+`autoprobe run --goal ...` argument.
+
+To be clear, `autoprobe` can still perform regular tool calls. The difference is really just
 that in each iteration, the context passed to the LLM is constructed entirely from scratch.
 Established tools like `read`, `write`, `edit`, and `bash` are also how the agent is
 expected to update the library.
@@ -73,4 +77,4 @@ Execution continues until the model no longer returns any tool calls.
 
 The installed programs are automatically executed on every iteration and so have a chance to
 feed information from the environment to the agent pro-actively. Skills also hard-code the
-progressive disclosure mechanism, whereas hopper can evolve its own.
+progressive disclosure mechanism, whereas autoprobe can evolve its own.

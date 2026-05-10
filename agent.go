@@ -32,7 +32,7 @@ func NewAgent(client *anthropic.Client, root, goal string, debug bool) *Agent {
 
 func (a *Agent) expandVar(name string) string {
 	switch name {
-	case "HOPPER_PROGRAMS_DIR":
+	case "AUTOPROBE_PROGRAMS_DIR":
 		return a.programsDir
 	}
 	return ""

@@ -17,7 +17,7 @@ import (
 //go:embed all:assets
 var assetsFS embed.FS
 
-const defaultHopperDir = ".hopper"
+const defaultProbeDir = ".autoprobe"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -45,22 +45,22 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: hopper <command> [arguments]")
+	fmt.Fprintln(os.Stderr, "usage: autoprobe <command> [arguments]")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  init [path]   create a hopper directory (default: .hopper)")
-	fmt.Fprintln(os.Stderr, "  run  [path]   run the agent against a hopper directory (default: .hopper)")
+	fmt.Fprintln(os.Stderr, "  init [path]   create an autoprobe directory (default: .autoprobe)")
+	fmt.Fprintln(os.Stderr, "  run  [path]   run the agent against an autoprobe directory (default: .autoprobe)")
 }
 
 func cmdInit(args []string) error {
 	cmd := flag.NewFlagSet("init", flag.ExitOnError)
 	cmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: hopper init [path]")
+		fmt.Fprintln(os.Stderr, "usage: autoprobe init [path]")
 		cmd.PrintDefaults()
 	}
 	cmd.Parse(args)
 
-	path := defaultHopperDir
+	path := defaultProbeDir
 	if cmd.NArg() > 0 {
 		path = cmd.Arg(0)
 	}
@@ -80,8 +80,8 @@ func cmdInit(args []string) error {
 			return err
 		}
 		if len(entries) > 0 {
-			if !looksLikeHopperDir(path) {
-				return fmt.Errorf("%s already exists and does not look like a hopper directory (expected programs/ and reinforcement/ subdirs)", path)
+			if !looksLikeProbeDir(path) {
+				return fmt.Errorf("%s already exists and does not look like an autoprobe directory (expected programs/ and reinforcement/ subdirs)", path)
 			}
 			update = true
 		}
@@ -91,14 +91,14 @@ func cmdInit(args []string) error {
 		return err
 	}
 	if update {
-		fmt.Printf("updated hopper directory at %s\n", path)
+		fmt.Printf("updated autoprobe directory at %s\n", path)
 	} else {
-		fmt.Printf("initialized hopper directory at %s\n", path)
+		fmt.Printf("initialized autoprobe directory at %s\n", path)
 	}
 	return nil
 }
 
-func looksLikeHopperDir(path string) bool {
+func looksLikeProbeDir(path string) bool {
 	for _, sub := range []string{"programs", "reinforcement"} {
 		info, err := os.Stat(filepath.Join(path, sub))
 		if err != nil || !info.IsDir() {
@@ -113,20 +113,20 @@ func cmdRun(args []string) error {
 	debug := cmd.Bool("debug", false, "wait for user input between iterations")
 	goal := cmd.String("goal", "", "inline goal statement appended to the conversation as the last program output")
 	cmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: hopper run [--debug] [--goal <text>] [path]")
+		fmt.Fprintln(os.Stderr, "usage: autoprobe run [--debug] [--goal <text>] [path]")
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "  --debug        wait for user input between iterations")
 		fmt.Fprintln(os.Stderr, "  --goal <text>  inline goal statement appended to the conversation as the last program output")
 	}
 	cmd.Parse(args)
 
-	path := defaultHopperDir
+	path := defaultProbeDir
 	if cmd.NArg() > 0 {
 		path = cmd.Arg(0)
 	}
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("hopper directory %s not found (run `hopper init`)", path)
+			return fmt.Errorf("autoprobe directory %s not found (run `autoprobe init`)", path)
 		}
 		return err
 	}
