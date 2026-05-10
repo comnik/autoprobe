@@ -96,6 +96,46 @@ Execution continues until the model no longer returns any tool calls.
 
 ![Workflow](workflow.png)
 
+## Usage
+
+Initialize an `autoprobe` directory in your project:
+
+```
+autoprobe init
+```
+
+This launches an interactive picker for the model provider (Anthropic, OpenAI, or Google)
+and a specific model, then creates `.autoprobe/`:
+
+- `config.yaml` — the chosen provider and model
+- `programs/` — the cornerstone program plus anything you or the agent install
+- `reinforcement/` — per-tool reinforcement messages appended to tool results
+
+Skip the picker by passing both flags:
+
+```
+autoprobe init --provider openai --model gpt-5-codex
+```
+
+Passing only one of `--provider` / `--model` skips that screen and prompts for the other.
+
+Re-running `init` on an existing directory refreshes the embedded assets and preserves your
+config unless you override it via flags or the picker.
+
+Set the appropriate API key for your chosen provider:
+
+- Anthropic: `ANTHROPIC_API_KEY`
+- OpenAI: `OPENAI_API_KEY`
+- Google: `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+
+Then run the agent:
+
+```
+autoprobe run                            # run autoprobe on the .autoprobe/ directory
+autoprobe run --goal "make tests pass"   # inline goal, appended as a final program output
+autoprobe run --debug                    # pause between iterations
+```
+
 ## FAQ
 
 **Q: How is this different from having an agent write skills or tools?**
@@ -106,7 +146,10 @@ progressive disclosure mechanism, whereas with `autoprobe` the agent can evolve 
 
 **Q: Can I use `autoprobe` with my favourite model?**
 
-Not yet. The current implementation is a minimal proof-of-concept hard-coded to use Claude.
+`autoprobe` supports Anthropic Claude, OpenAI (including Codex), and Google Gemini.
+Pick one when running `autoprobe init` (or pass `--provider` and `--model` to skip
+the picker). Reasoning / thinking content round-trips across turns for all three
+providers, so multi-turn tool use works the same way regardless of which you choose.
 
 **Q: Can I use `autoprobe` with my favourite coding harness?**
 

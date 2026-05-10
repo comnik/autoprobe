@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -171,16 +170,49 @@ func (m tuiModel) contentWidth() int {
 	return w
 }
 
+// blockEntry is one renderable unit in the conversation: either a content
+// piece of an assistant message (text/thinking/toolCall), a piece of a user
+// message (text), or a tool result.
 type blockEntry struct {
-	role  anthropic.MessageParamRole
-	block anthropic.ContentBlockParamUnion
+	role Role
+
+	// At most one of these is non-nil.
+	userText   *TextContent
+	asstText   *TextContent
+	thinking   *ThinkingContent
+	toolCall   *ToolCall
+	toolResult *ToolResultMessage
 }
 
-func collectBlocks(conversation []anthropic.MessageParam) []blockEntry {
+func (e blockEntry) isAssistantText() bool { return e.asstText != nil }
+func (e blockEntry) isUserText() bool      { return e.userText != nil }
+
+func collectBlocks(conversation []Message) []blockEntry {
 	var entries []blockEntry
 	for _, msg := range conversation {
-		for _, block := range msg.Content {
-			entries = append(entries, blockEntry{role: msg.Role, block: block})
+		switch m := msg.(type) {
+		case UserMessage:
+			for i := range m.Content {
+				c := m.Content[i]
+				entries = append(entries, blockEntry{role: RoleUser, userText: &c})
+			}
+		case AssistantMessage:
+			for _, c := range m.Content {
+				switch c := c.(type) {
+				case TextContent:
+					t := c
+					entries = append(entries, blockEntry{role: RoleAssistant, asstText: &t})
+				case ThinkingContent:
+					th := c
+					entries = append(entries, blockEntry{role: RoleAssistant, thinking: &th})
+				case ToolCall:
+					tc := c
+					entries = append(entries, blockEntry{role: RoleAssistant, toolCall: &tc})
+				}
+			}
+		case ToolResultMessage:
+			tr := m
+			entries = append(entries, blockEntry{role: RoleToolResult, toolResult: &tr})
 		}
 	}
 	return entries
@@ -191,8 +223,7 @@ func collectBlocks(conversation []anthropic.MessageParam) []blockEntry {
 // TUI so the model's most recent narration stays visible.
 func findLatestAssistantText(entries []blockEntry) int {
 	for i := len(entries) - 1; i >= 0; i-- {
-		e := entries[i]
-		if e.role == anthropic.MessageParamRoleAssistant && e.block.OfText != nil {
+		if entries[i].isAssistantText() {
 			return i
 		}
 	}
@@ -212,7 +243,7 @@ func (m *tuiModel) refreshContent() {
 	}
 
 	for i, entry := range entries {
-		body := renderBlock(entry.block, entry.role, cw)
+		body := renderBlock(entry, cw)
 		h := lipgloss.Height(body)
 		// Inactive blocks cap at maxMsgHeight; the active block expands so the
 		// user can see every line.
@@ -361,29 +392,29 @@ func (m tuiModel) View() string {
 }
 
 var (
-	headerTitleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
-	headerInfoStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	headerErrStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	footerStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	footerKeyStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	headerTitleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
+	headerInfoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	headerErrStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	footerStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	footerKeyStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 	activeSeparatorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 	scrollInfoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 
 	roleAsstStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 	blockHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
 	userTextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	asstTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("16"))
-	toolUseStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
-	toolNameStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("84"))
-	toolOkStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
-	toolErrStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	thinkingStyle  = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("141"))
-	separatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	asstTextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("16"))
+	toolUseStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
+	toolNameStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("84"))
+	toolOkStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
+	toolErrStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	thinkingStyle    = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("141"))
+	separatorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 )
 
 func (m tuiModel) renderHeader() string {
 	title := headerTitleStyle.Render("autoprobe")
-	info := fmt.Sprintf("iteration %d  •  %s", m.agent.Iteration(), m.stateLabel())
+	info := fmt.Sprintf("iteration %d  •  %s  •  %s", m.agent.Iteration(), m.agent.Provider().Name(), m.stateLabel())
 	style := headerInfoStyle
 	if m.state == stateError {
 		style = headerErrStyle
@@ -413,10 +444,10 @@ func (m tuiModel) stateLabel() string {
 func (m tuiModel) renderBlockHeader(i int, entry blockEntry) string {
 	var label string
 	switch {
-	case entry.role == anthropic.MessageParamRoleAssistant && entry.block.OfText != nil:
+	case entry.isAssistantText():
 		label = roleAsstStyle.Render("ASSISTANT")
-	case entry.role == anthropic.MessageParamRoleUser && entry.block.OfText != nil:
-		label = blockHeaderStyle.Render(firstLine(entry.block.OfText.Text))
+	case entry.isUserText():
+		label = blockHeaderStyle.Render(firstLine(entry.userText.Text))
 	}
 
 	out := label
@@ -473,39 +504,40 @@ func (m tuiModel) renderFooter() string {
 	return footerStyle.Render(strings.Repeat("─", m.contentWidth())) + "\n" + strings.Join(parts, footerStyle.Render("  •  "))
 }
 
-func renderBlock(block anthropic.ContentBlockParamUnion, role anthropic.MessageParamRole, width int) string {
-	textStyle := userTextStyle
-	if role == anthropic.MessageParamRoleAssistant {
-		textStyle = asstTextStyle
-	}
+func renderBlock(entry blockEntry, width int) string {
 	switch {
-	case block.OfText != nil:
-		text := block.OfText.Text
+	case entry.userText != nil:
 		// User text blocks promote their first line (front matter like
 		// `[program=… exit=…]` or `[YOUR GOAL]`) into the block header.
-		if role == anthropic.MessageParamRoleUser {
-			text = skipFirstLine(text)
+		return wrapStyled(userTextStyle, skipFirstLine(entry.userText.Text), width)
+	case entry.asstText != nil:
+		return wrapStyled(asstTextStyle, entry.asstText.Text, width)
+	case entry.thinking != nil:
+		body := entry.thinking.Thinking
+		if entry.thinking.Redacted {
+			body = "(redacted)"
 		}
-		return wrapStyled(textStyle, text, width)
-	case block.OfThinking != nil:
-		return wrapStyled(thinkingStyle, "(thinking) "+block.OfThinking.Thinking, width)
-	case block.OfToolUse != nil:
-		input, _ := json.Marshal(block.OfToolUse.Input)
-		combined := toolNameStyle.Render("→ "+block.OfToolUse.Name) +
-			toolUseStyle.Render("("+string(input)+")")
-		return lipgloss.NewStyle().Width(width).Render(combined)
-	case block.OfToolResult != nil:
-		var result strings.Builder
-		for _, c := range block.OfToolResult.Content {
-			if c.OfText != nil {
-				result.WriteString(c.OfText.Text)
+		return wrapStyled(thinkingStyle, "(thinking) "+body, width)
+	case entry.toolCall != nil:
+		input := string(entry.toolCall.Arguments)
+		if input == "" {
+			input = "{}"
+		} else {
+			// Pretty up by re-marshalling if it parses; fall back to raw.
+			var v any
+			if err := json.Unmarshal(entry.toolCall.Arguments, &v); err == nil {
+				if b, err := json.Marshal(v); err == nil {
+					input = string(b)
+				}
 			}
 		}
-		text := result.String()
-		isErr := block.OfToolResult.IsError.Or(false)
+		combined := toolNameStyle.Render("→ "+entry.toolCall.Name) + toolUseStyle.Render("("+input+")")
+		return lipgloss.NewStyle().Width(width).Render(combined)
+	case entry.toolResult != nil:
+		text := joinText(entry.toolResult.Content)
 		label := "← result:"
 		style := toolOkStyle
-		if isErr {
+		if entry.toolResult.IsError {
 			label = "← error:"
 			style = toolErrStyle
 		}

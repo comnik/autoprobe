@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,18 +9,16 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-
-	"github.com/anthropics/anthropic-sdk-go"
 )
 
-func NewAgent(client *anthropic.Client, root, goal string, debug bool) *Agent {
+func NewAgent(provider Provider, root, goal string, debug bool) *Agent {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
 	programsDir := filepath.Join(root, "programs")
 	reinforcementDir := filepath.Join(root, "reinforcement")
 	return &Agent{
-		client:           client,
+		provider:         provider,
 		programsDir:      programsDir,
 		reinforcementDir: reinforcementDir,
 		goal:             goal,
@@ -39,20 +36,21 @@ func (a *Agent) expandVar(name string) string {
 }
 
 type Agent struct {
-	client           *anthropic.Client
+	provider         Provider
 	programsDir      string
 	reinforcementDir string
 	goal             string
 	tools            []ToolDefinition
 	debug            bool
 
-	conversation []anthropic.MessageParam
+	conversation []Message
 	iteration    int
 }
 
-func (a *Agent) Conversation() []anthropic.MessageParam { return a.conversation }
-func (a *Agent) Iteration() int                         { return a.iteration }
-func (a *Agent) StepThrough() bool                      { return a.debug }
+func (a *Agent) Conversation() []Message { return a.conversation }
+func (a *Agent) Iteration() int          { return a.iteration }
+func (a *Agent) StepThrough() bool       { return a.debug }
+func (a *Agent) Provider() Provider      { return a.provider }
 
 func (a *Agent) Run(ctx context.Context) error {
 	return runTUI(ctx, a)
@@ -71,54 +69,70 @@ func (a *Agent) Prime(ctx context.Context) error {
 // Step runs a single inference + tool execution iteration. Returns the
 // assistant message produced and whether the agent has finished (no further
 // tool calls).
-func (a *Agent) Step(ctx context.Context) (*anthropic.Message, bool, error) {
-	message, err := a.runInference(ctx, a.conversation)
-	if err != nil {
-		return nil, false, err
+func (a *Agent) Step(ctx context.Context) (AssistantMessage, bool, error) {
+	c := Context{
+		Messages: a.conversation,
+		Tools:    a.tools,
 	}
-	if message.StopReason == anthropic.StopReasonMaxTokens {
-		return message, false, fmt.Errorf("response hit the max_tokens limit; bump the budget in runInference")
+	msg, err := a.provider.Generate(ctx, "", c, Options{MaxTokens: 8192})
+	if err != nil {
+		return AssistantMessage{}, false, err
+	}
+	if msg.StopReason == StopMaxTokens {
+		return msg, false, fmt.Errorf("response hit the max_tokens limit; bump the budget in Step")
+	}
+	if msg.StopReason == StopError {
+		return msg, false, fmt.Errorf("provider error: %s", msg.Err)
 	}
 	a.iteration++
-	a.conversation = append(a.conversation, message.ToParam())
+	a.conversation = append(a.conversation, msg)
 
-	toolResults := []anthropic.ContentBlockParamUnion{}
-	for _, content := range message.Content {
-		if content.Type == "tool_use" {
-			result := a.executeTool(content.ID, content.Name, content.Input)
-			toolResults = append(toolResults, result)
+	var results []Message
+	for _, c := range msg.Content {
+		if call, ok := c.(ToolCall); ok {
+			results = append(results, a.executeTool(call))
 		}
 	}
-	if len(toolResults) == 0 {
-		return message, true, nil
+	if len(results) == 0 {
+		return msg, true, nil
 	}
-	a.conversation = append(a.conversation, anthropic.NewUserMessage(toolResults...))
-	return message, false, nil
+	a.conversation = append(a.conversation, results...)
+	return msg, false, nil
 }
 
-func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.ContentBlockParamUnion {
+func (a *Agent) executeTool(call ToolCall) ToolResultMessage {
 	var toolDef ToolDefinition
 	var found bool
 	for _, tool := range a.tools {
-		if tool.Name == name {
+		if tool.Name == call.Name {
 			toolDef = tool
 			found = true
 			break
 		}
 	}
 	if !found {
-		return anthropic.NewToolResultBlock(id, "tool not found", true)
+		return ToolResultMessage{
+			ToolCallID: call.ID,
+			ToolName:   call.Name,
+			Content:    []TextContent{{Text: "tool not found"}},
+			IsError:    true,
+		}
 	}
 
-	response, err := toolDef.Function(input)
+	response, err := toolDef.Function(call.Arguments)
 	isError := err != nil
 	if isError {
 		response = err.Error()
 	}
-	if r := a.readReinforcement(name); r != "" {
+	if r := a.readReinforcement(call.Name); r != "" {
 		response = response + "\n\n" + r
 	}
-	return anthropic.NewToolResultBlock(id, response, isError)
+	return ToolResultMessage{
+		ToolCallID: call.ID,
+		ToolName:   call.Name,
+		Content:    []TextContent{{Text: response}},
+		IsError:    isError,
+	}
 }
 
 func (a *Agent) readReinforcement(name string) string {
@@ -129,7 +143,7 @@ func (a *Agent) readReinforcement(name string) string {
 	return strings.TrimSpace(os.Expand(string(data), a.expandVar))
 }
 
-func (a *Agent) buildConversation(ctx context.Context) ([]anthropic.MessageParam, error) {
+func (a *Agent) buildConversation(ctx context.Context) ([]Message, error) {
 	entries, err := os.ReadDir(a.programsDir)
 	if err != nil {
 		return nil, fmt.Errorf("reading programs dir: %w", err)
@@ -163,28 +177,14 @@ func (a *Agent) buildConversation(ctx context.Context) ([]anthropic.MessageParam
 		outputs[i] = append([]byte(header), out...)
 	}
 
-	blocks := make([]anthropic.ContentBlockParamUnion, 0, len(outputs)+1)
+	contents := make([]TextContent, 0, len(outputs)+1)
 	for _, out := range outputs {
-		blocks = append(blocks, anthropic.NewTextBlock(string(out)))
+		contents = append(contents, TextContent{Text: string(out)})
 	}
 	if a.goal != "" {
-		blocks = append(blocks, anthropic.NewTextBlock("[YOUR GOAL]\n"+a.goal))
+		contents = append(contents, TextContent{Text: "[YOUR GOAL]\n" + a.goal})
 	}
 
-	return []anthropic.MessageParam{anthropic.NewUserMessage(blocks...)}, nil
+	return []Message{UserMessage{Content: contents}}, nil
 }
 
-func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
-	tools := make([]anthropic.ToolUnionParam, len(a.tools))
-	for i, t := range a.tools {
-		tools[i] = t.AsParam()
-	}
-
-	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeOpus4_7,
-		MaxTokens: 8192,
-		Messages:  conversation,
-		Tools:     tools,
-	})
-	return message, err
-}

@@ -6,25 +6,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-
-	"github.com/anthropics/anthropic-sdk-go"
 )
 
 type ToolDefinition struct {
 	Name        string
 	Description string
-	InputSchema anthropic.ToolInputSchemaParam
+	Parameters  map[string]any // JSON Schema; each provider translates to its native shape
 	Function    func(input json.RawMessage) (string, error)
-}
-
-func (t ToolDefinition) AsParam() anthropic.ToolUnionParam {
-	return anthropic.ToolUnionParam{
-		OfTool: &anthropic.ToolParam{
-			Name:        t.Name,
-			Description: anthropic.String(t.Description),
-			InputSchema: t.InputSchema,
-		},
-	}
 }
 
 var DefaultTools = []ToolDefinition{ReadTool, BashTool, EditTool, WriteTool}
@@ -32,14 +20,15 @@ var DefaultTools = []ToolDefinition{ReadTool, BashTool, EditTool, WriteTool}
 var ReadTool = ToolDefinition{
 	Name:        "read",
 	Description: "Read the contents of a file at the given path. Returns the file's text contents.",
-	InputSchema: anthropic.ToolInputSchemaParam{
-		Properties: map[string]any{
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
 			"path": map[string]any{
 				"type":        "string",
 				"description": "Path to the file to read.",
 			},
 		},
-		Required: []string{"path"},
+		"required": []string{"path"},
 	},
 	Function: readFile,
 }
@@ -61,14 +50,15 @@ func readFile(input json.RawMessage) (string, error) {
 var BashTool = ToolDefinition{
 	Name:        "bash",
 	Description: "Execute a bash command and return the combined stdout and stderr.",
-	InputSchema: anthropic.ToolInputSchemaParam{
-		Properties: map[string]any{
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
 			"command": map[string]any{
 				"type":        "string",
 				"description": "Bash command to execute.",
 			},
 		},
-		Required: []string{"command"},
+		"required": []string{"command"},
 	},
 	Function: runBash,
 }
@@ -90,8 +80,9 @@ func runBash(input json.RawMessage) (string, error) {
 var EditTool = ToolDefinition{
 	Name:        "edit",
 	Description: "Replace exactly one occurrence of old_string with new_string in the file at path. Fails if old_string is missing or appears more than once.",
-	InputSchema: anthropic.ToolInputSchemaParam{
-		Properties: map[string]any{
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
 			"path": map[string]any{
 				"type":        "string",
 				"description": "Path to the file to edit.",
@@ -105,7 +96,7 @@ var EditTool = ToolDefinition{
 				"description": "Replacement text.",
 			},
 		},
-		Required: []string{"path", "old_string", "new_string"},
+		"required": []string{"path", "old_string", "new_string"},
 	},
 	Function: editFile,
 }
@@ -141,8 +132,9 @@ func editFile(input json.RawMessage) (string, error) {
 var WriteTool = ToolDefinition{
 	Name:        "write",
 	Description: "Create a new file or overwrite an existing file with the given content.",
-	InputSchema: anthropic.ToolInputSchemaParam{
-		Properties: map[string]any{
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
 			"path": map[string]any{
 				"type":        "string",
 				"description": "Path to the file to write.",
@@ -152,7 +144,7 @@ var WriteTool = ToolDefinition{
 				"description": "Content to write to the file.",
 			},
 		},
-		Required: []string{"path", "content"},
+		"required": []string{"path", "content"},
 	},
 	Function: writeFile,
 }

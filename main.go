@@ -10,8 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/anthropics/anthropic-sdk-go"
 )
 
 //go:embed all:assets
@@ -48,17 +46,30 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: autoprobe <command> [arguments]")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  init [path]   create an autoprobe directory (default: .autoprobe)")
-	fmt.Fprintln(os.Stderr, "  run  [path]   run the agent against an autoprobe directory (default: .autoprobe)")
+	fmt.Fprintln(os.Stderr, "  init [--provider <p>] [--model <m>] [path]   create an autoprobe directory (default: .autoprobe)")
+	fmt.Fprintln(os.Stderr, "  run  [path]                                  run the agent against an autoprobe directory (default: .autoprobe)")
 }
 
 func cmdInit(args []string) error {
 	cmd := flag.NewFlagSet("init", flag.ExitOnError)
+	providerName := cmd.String("provider", "anthropic", "LLM provider: anthropic | openai | google")
+	model := cmd.String("model", "", "model id (provider-specific; empty means use the provider's default)")
 	cmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: autoprobe init [path]")
-		cmd.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "usage: autoprobe init [--provider <name>] [--model <id>] [path]")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "  --provider     anthropic (default), openai, or google")
+		fmt.Fprintln(os.Stderr, "  --model        model id; empty uses the provider's default")
 	}
 	cmd.Parse(args)
+
+	// Track which flags the user actually passed so we can preserve existing
+	// config values on update when a flag was omitted.
+	setFlags := map[string]bool{}
+	cmd.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+	if !validProvider(*providerName) {
+		return fmt.Errorf("unknown provider %q (expected anthropic, openai, or google)", *providerName)
+	}
 
 	path := defaultProbeDir
 	if cmd.NArg() > 0 {
@@ -90,12 +101,58 @@ func cmdInit(args []string) error {
 	if err := extractAssets(path); err != nil {
 		return err
 	}
-	if update {
-		fmt.Printf("updated autoprobe directory at %s\n", path)
-	} else {
-		fmt.Printf("initialized autoprobe directory at %s\n", path)
+
+	cfg := Config{Provider: *providerName, Model: *model}
+	if update && configExists(path) {
+		// Seed both the picker pre-selection and the no-flag fallback from the
+		// existing file.
+		existing, err := LoadConfig(path)
+		if err != nil {
+			return err
+		}
+		if !setFlags["provider"] {
+			cfg.Provider = existing.Provider
+		}
+		if !setFlags["model"] {
+			cfg.Model = existing.Model
+		}
 	}
+
+	// Prompt interactively for whichever fields the user didn't pin via flag.
+	// Both pinned → no TUI; one pinned → only the other screen shows.
+	if !setFlags["provider"] || !setFlags["model"] {
+		picked, err := runInitPicker(cfg, setFlags["provider"], setFlags["model"])
+		if err != nil {
+			return err
+		}
+		cfg = picked
+	}
+	if !validProvider(cfg.Provider) {
+		return fmt.Errorf("unknown provider %q (expected anthropic, openai, or google)", cfg.Provider)
+	}
+
+	if err := WriteConfig(path, cfg); err != nil {
+		return err
+	}
+
+	verb := "initialized"
+	if update {
+		verb = "updated"
+	}
+	fmt.Printf("%s autoprobe directory at %s (provider=%s", verb, path, cfg.Provider)
+	if cfg.Model != "" {
+		fmt.Printf(" model=%s", cfg.Model)
+	}
+	fmt.Println(")")
 	return nil
+}
+
+func validProvider(name string) bool {
+	switch name {
+	case "anthropic", "openai", "google":
+		return true
+	}
+	return false
 }
 
 func looksLikeProbeDir(path string) bool {
@@ -131,9 +188,33 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	client := anthropic.NewClient()
-	agent := NewAgent(&client, path, *goal, *debug)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("config file %s not found (re-run `autoprobe init` to create it)", configPath(path))
+		}
+		return err
+	}
+
+	provider, err := buildProvider(cfg.Provider, cfg.Model)
+	if err != nil {
+		return err
+	}
+	agent := NewAgent(provider, path, *goal, *debug)
 	return agent.Run(context.TODO())
+}
+
+func buildProvider(name, model string) (Provider, error) {
+	switch name {
+	case "anthropic", "":
+		return NewAnthropicProvider(model), nil
+	case "openai":
+		return NewOpenAIProvider(model), nil
+	case "google":
+		return NewGoogleProvider(model)
+	default:
+		return nil, fmt.Errorf("unknown provider %q (expected anthropic, openai, or google)", name)
+	}
 }
 
 func extractAssets(dest string) error {
