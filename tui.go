@@ -12,6 +12,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+const (
+	maxMsgHeight  = 20
+	maxLineLength = 92
+)
+
 type tuiState int
 
 const (
@@ -23,15 +28,17 @@ const (
 )
 
 type tuiModel struct {
-	agent       *Agent
-	ctx         context.Context
-	state       tuiState
-	stepThrough bool
-	err         error
-	width       int
-	height      int
-	viewport    viewport.Model
-	ready       bool
+	agent        *Agent
+	ctx          context.Context
+	state        tuiState
+	stepThrough  bool
+	err          error
+	width        int
+	height       int
+	msgViewports []viewport.Model
+	activeIdx    int
+	outerVp      viewport.Model
+	ready        bool
 }
 
 type primedMsg struct{ err error }
@@ -71,19 +78,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		headerH := 2
-		footerH := 2
-		bodyH := msg.Height - headerH - footerH
-		if bodyH < 1 {
-			bodyH = 1
-		}
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width, bodyH)
-			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = bodyH
-		}
+		m.ready = true
 		m.refreshContent()
 		return m, nil
 
@@ -129,6 +124,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.refreshContent()
 			return m, nil
+		case "tab":
+			if len(m.msgViewports) > 0 {
+				m.activeIdx = (m.activeIdx + 1) % len(m.msgViewports)
+				m.refreshContent()
+				m.scrollOuterToActive()
+			}
+			return m, nil
 		case "enter", " ":
 			switch m.state {
 			case stateReady:
@@ -140,12 +142,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		var cmd tea.Cmd
-		m.viewport, cmd = m.viewport.Update(msg)
+		m.outerVp, cmd = m.outerVp.Update(msg)
 		return m, cmd
 	}
 
 	var cmd tea.Cmd
-	m.viewport, cmd = m.viewport.Update(msg)
+	m.outerVp, cmd = m.outerVp.Update(msg)
 	return m, cmd
 }
 
@@ -158,35 +160,219 @@ func (m tuiModel) advance() (tuiState, tea.Cmd) {
 	return stateRunning, m.step()
 }
 
+func (m tuiModel) contentWidth() int {
+	w := m.width - 2
+	if w > maxLineLength {
+		w = maxLineLength
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+type blockEntry struct {
+	role  anthropic.MessageParamRole
+	block anthropic.ContentBlockParamUnion
+}
+
+func collectBlocks(conversation []anthropic.MessageParam) []blockEntry {
+	var entries []blockEntry
+	for _, msg := range conversation {
+		for _, block := range msg.Content {
+			entries = append(entries, blockEntry{role: msg.Role, block: block})
+		}
+	}
+	return entries
+}
+
+// findLatestAssistantText returns the index of the most recent assistant text
+// block in entries, or -1 if none. That block is pinned at the bottom of the
+// TUI so the model's most recent narration stays visible.
+func findLatestAssistantText(entries []blockEntry) int {
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.role == anthropic.MessageParamRoleAssistant && e.block.OfText != nil {
+			return i
+		}
+	}
+	return -1
+}
+
 func (m *tuiModel) refreshContent() {
 	if !m.ready {
 		return
 	}
-	m.viewport.SetContent(renderConversation(m.agent.Conversation(), m.width))
-	m.viewport.GotoBottom()
+	entries := collectBlocks(m.agent.Conversation())
+	cw := m.contentWidth()
+
+	prevLen := len(m.msgViewports)
+	for i := prevLen; i < len(entries); i++ {
+		m.msgViewports = append(m.msgViewports, viewport.New(cw, 1))
+	}
+
+	for i, entry := range entries {
+		body := renderBlock(entry.block, entry.role, cw)
+		h := lipgloss.Height(body)
+		// Inactive blocks cap at maxMsgHeight; the active block expands so the
+		// user can see every line.
+		if i != m.activeIdx && h > maxMsgHeight {
+			h = maxMsgHeight
+		}
+		if h < 1 {
+			h = 1
+		}
+		m.msgViewports[i].Width = cw
+		m.msgViewports[i].Height = h
+		m.msgViewports[i].SetContent(body)
+		m.msgViewports[i].GotoBottom()
+	}
+
+	if len(m.msgViewports) > prevLen {
+		m.activeIdx = len(m.msgViewports) - 1
+	}
+	if m.activeIdx >= len(m.msgViewports) {
+		m.activeIdx = 0
+	}
+
+	m.refreshOuter()
+	if len(m.msgViewports) > prevLen {
+		m.outerVp.GotoBottom()
+	}
+}
+
+// refreshOuter rebuilds the outer viewport's content + dimensions from the
+// current per-block viewports, while preserving the user's scroll position.
+func (m *tuiModel) refreshOuter() {
+	if !m.ready {
+		return
+	}
+	entries := collectBlocks(m.agent.Conversation())
+	pinnedIdx := findLatestAssistantText(entries)
+
+	headerH := 1
+	footerH := 2
+	pinnedH := 0
+	if pinnedIdx >= 0 && pinnedIdx < len(m.msgViewports) {
+		// separator + header line + viewport body
+		pinnedH = 2 + m.msgViewports[pinnedIdx].Height
+	}
+	outerH := m.height - headerH - footerH - pinnedH
+	if outerH < 1 {
+		outerH = 1
+	}
+
+	cw := m.contentWidth()
+	m.outerVp.Width = cw
+	m.outerVp.Height = outerH
+
+	yOffset := m.outerVp.YOffset
+	content, _ := m.buildOuterContent(entries, pinnedIdx)
+	m.outerVp.SetContent(content)
+	m.outerVp.YOffset = yOffset
+}
+
+// scrollOuterToActive scrolls the outer viewport so that the active block's
+// separator becomes the top visible line. No-op when the active block is
+// pinned (it's always visible) or when activeIdx is out of range.
+func (m *tuiModel) scrollOuterToActive() {
+	if !m.ready {
+		return
+	}
+	entries := collectBlocks(m.agent.Conversation())
+	pinnedIdx := findLatestAssistantText(entries)
+	if m.activeIdx == pinnedIdx {
+		return
+	}
+	_, activeLine := m.buildOuterContent(entries, pinnedIdx)
+	if activeLine < 0 {
+		return
+	}
+	maxY := m.outerVp.TotalLineCount() - m.outerVp.Height
+	if activeLine > maxY {
+		activeLine = maxY
+	}
+	if activeLine < 0 {
+		activeLine = 0
+	}
+	m.outerVp.YOffset = activeLine
+}
+
+// buildOuterContent renders the scrollable region (everything except pinned)
+// and returns both the rendered string and the 0-indexed line offset where
+// the active block's separator starts (or -1 if the active block is pinned
+// or out of range).
+func (m tuiModel) buildOuterContent(entries []blockEntry, pinnedIdx int) (string, int) {
+	var b strings.Builder
+	cw := m.contentWidth()
+	first := true
+	activeLine := -1
+	for i, entry := range entries {
+		if i == pinnedIdx {
+			continue
+		}
+		if !first {
+			b.WriteString("\n")
+		}
+		first = false
+		if i == m.activeIdx {
+			activeLine = lipgloss.Height(b.String()) - 1
+		}
+		b.WriteString(m.blockSeparator(i, cw))
+		b.WriteString("\n")
+		b.WriteString(m.renderBlockHeader(i, entry))
+		b.WriteString("\n")
+		b.WriteString(m.msgViewports[i].View())
+	}
+	return b.String(), activeLine
+}
+
+func (m tuiModel) blockSeparator(i, width int) string {
+	style := separatorStyle
+	if i == m.activeIdx {
+		style = activeSeparatorStyle
+	}
+	return style.Render(strings.Repeat("─", width))
 }
 
 func (m tuiModel) View() string {
 	if !m.ready {
 		return "initializing…"
 	}
-	return strings.Join([]string{
-		m.renderHeader(),
-		m.viewport.View(),
-		m.renderFooter(),
-	}, "\n")
+	sections := []string{m.renderHeader()}
+
+	entries := collectBlocks(m.agent.Conversation())
+	if len(entries) == 0 {
+		sections = append(sections, headerInfoStyle.Render("(no messages yet)"))
+	} else {
+		sections = append(sections, m.outerVp.View())
+
+		pinnedIdx := findLatestAssistantText(entries)
+		if pinnedIdx >= 0 && pinnedIdx < len(m.msgViewports) {
+			cw := m.contentWidth()
+			sections = append(sections, m.blockSeparator(pinnedIdx, cw))
+			sections = append(sections, m.renderBlockHeader(pinnedIdx, entries[pinnedIdx]))
+			sections = append(sections, m.msgViewports[pinnedIdx].View())
+		}
+	}
+
+	sections = append(sections, m.renderFooter())
+	return strings.Join(sections, "\n")
 }
 
 var (
-	headerTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
-	headerInfoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	headerErrStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	footerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	footerKeyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	headerTitleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
+	headerInfoStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	headerErrStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	footerStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	footerKeyStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	activeSeparatorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	scrollInfoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 
-	roleUserStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	roleAsstStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-	textBodyStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	roleAsstStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	blockHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	userTextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	asstTextStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("16"))
 	toolUseStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
 	toolNameStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("84"))
 	toolOkStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
@@ -224,6 +410,46 @@ func (m tuiModel) stateLabel() string {
 	return ""
 }
 
+func (m tuiModel) renderBlockHeader(i int, entry blockEntry) string {
+	var label string
+	switch {
+	case entry.role == anthropic.MessageParamRoleAssistant && entry.block.OfText != nil:
+		label = roleAsstStyle.Render("ASSISTANT")
+	case entry.role == anthropic.MessageParamRoleUser && entry.block.OfText != nil:
+		label = blockHeaderStyle.Render(firstLine(entry.block.OfText.Text))
+	}
+
+	out := label
+
+	vp := m.msgViewports[i]
+	if vp.TotalLineCount() > vp.Height {
+		visibleEnd := vp.YOffset + vp.Height
+		if visibleEnd > vp.TotalLineCount() {
+			visibleEnd = vp.TotalLineCount()
+		}
+		sep := ""
+		if label != "" {
+			sep = "  "
+		}
+		out += sep + scrollInfoStyle.Render(fmt.Sprintf("[%d–%d/%d]", vp.YOffset+1, visibleEnd, vp.TotalLineCount()))
+	}
+	return out
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func skipFirstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[i+1:]
+	}
+	return ""
+}
+
 func (m tuiModel) renderFooter() string {
 	parts := []string{}
 	switch m.state {
@@ -240,56 +466,34 @@ func (m tuiModel) renderFooter() string {
 	}
 	parts = append(parts,
 		footerKeyStyle.Render("shift+tab")+footerStyle.Render(" "+mode),
+		footerKeyStyle.Render("tab")+footerStyle.Render(" focus next"),
 		footerKeyStyle.Render("↑/↓")+footerStyle.Render(" scroll"),
 		footerKeyStyle.Render("q")+footerStyle.Render(" quit"),
 	)
-	return footerStyle.Render(strings.Repeat("─", max(m.width, 1))) + "\n" + strings.Join(parts, footerStyle.Render("  •  "))
+	return footerStyle.Render(strings.Repeat("─", m.contentWidth())) + "\n" + strings.Join(parts, footerStyle.Render("  •  "))
 }
 
-func renderConversation(conversation []anthropic.MessageParam, width int) string {
-	var b strings.Builder
-	for i, msg := range conversation {
-		if i > 0 {
-			b.WriteString("\n")
-			b.WriteString(separatorStyle.Render(strings.Repeat("─", max(width, 1))))
-			b.WriteString("\n\n")
-		}
-		b.WriteString(renderMessage(msg, width))
+func renderBlock(block anthropic.ContentBlockParamUnion, role anthropic.MessageParamRole, width int) string {
+	textStyle := userTextStyle
+	if role == anthropic.MessageParamRoleAssistant {
+		textStyle = asstTextStyle
 	}
-	if len(conversation) == 0 {
-		return headerInfoStyle.Render("(no messages yet)")
-	}
-	return b.String()
-}
-
-func renderMessage(msg anthropic.MessageParam, width int) string {
-	var b strings.Builder
-	role := strings.ToUpper(string(msg.Role))
-	switch msg.Role {
-	case anthropic.MessageParamRoleUser:
-		b.WriteString(roleUserStyle.Render(role))
-	default:
-		b.WriteString(roleAsstStyle.Render(role))
-	}
-	b.WriteString("\n")
-	for i, block := range msg.Content {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(renderBlock(block, width))
-	}
-	return b.String()
-}
-
-func renderBlock(block anthropic.ContentBlockParamUnion, width int) string {
 	switch {
 	case block.OfText != nil:
-		return textBodyStyle.Render(block.OfText.Text)
+		text := block.OfText.Text
+		// User text blocks promote their first line (front matter like
+		// `[program=… exit=…]` or `[YOUR GOAL]`) into the block header.
+		if role == anthropic.MessageParamRoleUser {
+			text = skipFirstLine(text)
+		}
+		return wrapStyled(textStyle, text, width)
 	case block.OfThinking != nil:
-		return thinkingStyle.Render("(thinking) " + block.OfThinking.Thinking)
+		return wrapStyled(thinkingStyle, "(thinking) "+block.OfThinking.Thinking, width)
 	case block.OfToolUse != nil:
 		input, _ := json.Marshal(block.OfToolUse.Input)
-		return toolNameStyle.Render("→ "+block.OfToolUse.Name) + toolUseStyle.Render("("+string(input)+")")
+		combined := toolNameStyle.Render("→ "+block.OfToolUse.Name) +
+			toolUseStyle.Render("("+string(input)+")")
+		return lipgloss.NewStyle().Width(width).Render(combined)
 	case block.OfToolResult != nil:
 		var result strings.Builder
 		for _, c := range block.OfToolResult.Content {
@@ -299,15 +503,22 @@ func renderBlock(block anthropic.ContentBlockParamUnion, width int) string {
 		}
 		text := result.String()
 		isErr := block.OfToolResult.IsError.Or(false)
-		label := "← result"
+		label := "← result:"
 		style := toolOkStyle
 		if isErr {
-			label = "← error"
+			label = "← error:"
 			style = toolErrStyle
 		}
-		return style.Render(label+":\n") + style.Render(indent(text, "  "))
+		return wrapStyled(style, label+"\n"+indent(text, "  "), width)
 	}
 	return headerInfoStyle.Render("(unsupported block)")
+}
+
+func wrapStyled(style lipgloss.Style, text string, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	return style.Width(width).Render(text)
 }
 
 func indent(s, prefix string) string {
