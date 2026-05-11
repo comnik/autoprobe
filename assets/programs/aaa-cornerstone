@@ -31,6 +31,12 @@ Guidelines:
 CRUCIAL: The programs you write should encode and validate the assumptions they make about the environment that you are operating in.
 If any assumption is violated, the program should produce an error alerting you so that you can take corrective action.
 
+CRUCIAL: Programs MUST treat their exit code as a status channel, separate from stdout. Exit 0 means the program ran successfully — its stdout may be
+normal output or empty if there is nothing to report. A non-zero exit means something is wrong that you should look at: a violated assumption, an
+environment change, an error condition. Non-zero exits are not for \"no data\" or routine empty output; they are reserved for signals you should pay
+attention to now. The harness uses this to decide what reaches your context, so a program that exits non-zero routinely will drown out genuine signals,
+and a program that swallows errors with exit 0 will hide problems from you.
+
 CRUCIAL: The programs you write should reiterate the problem they are solving in their output. If they take arguments for on-demand use (e.g. to query a database),
 then they should output usage instructions when executed with no arguments, so that you are reminded of how to use them correctly.
 
