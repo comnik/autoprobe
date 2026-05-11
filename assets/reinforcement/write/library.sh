@@ -1,3 +1,23 @@
+#!/usr/bin/env bash
+# Reinforcement fired when the write target is inside $AUTOPROBE_PROGRAMS_DIR.
+# Reads the write tool's JSON arguments from stdin.
+set -eu
+
+path=$(python3 -c 'import json, sys; print(json.load(sys.stdin).get("path", ""))')
+[ -n "$path" ] || exit 0
+[ -n "${AUTOPROBE_PROGRAMS_DIR:-}" ] || exit 0
+
+case "$path" in
+    /*) abs="$path" ;;
+    *)  abs="$(pwd)/$path" ;;
+esac
+
+case "$abs" in
+    "$AUTOPROBE_PROGRAMS_DIR"/*) ;;
+    *) exit 0 ;;
+esac
+
+cat <<'EOF'
 REMEMBER: the programs you write should encode and validate the assumptions they make about
 the environment that you are operating in. If any assumption is violated, the program should
 produce an error alerting you so that you can take corrective action.
@@ -22,3 +42,4 @@ the user's goal. Prefer executable programs over static files, so that you can e
 assumptions.
 
 The solution program should also be written to the `$AUTOPROBE_PROGRAMS_DIR` directory.
+EOF

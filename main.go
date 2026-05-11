@@ -244,7 +244,12 @@ func extractAssets(dest string) error {
 			return err
 		}
 		mode := os.FileMode(0644)
-		if strings.HasPrefix(rel, "programs"+string(filepath.Separator)) {
+		parts := strings.Split(rel, string(filepath.Separator))
+		switch {
+		case parts[0] == "programs" && len(parts) > 1:
+			mode = 0755
+		case parts[0] == "reinforcement" && len(parts) > 2:
+			// Files inside reinforcement/<tool>/ are executable programs.
 			mode = 0755
 		}
 		return os.WriteFile(target, data, mode)

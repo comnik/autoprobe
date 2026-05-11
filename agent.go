@@ -39,14 +39,6 @@ func NewAgent(prov provider.Provider, root, goal string, debug bool) *Agent {
 	}
 }
 
-func (a *Agent) expandVar(name string) string {
-	switch name {
-	case "AUTOPROBE_PROGRAMS_DIR":
-		return a.programsDir
-	}
-	return ""
-}
-
 type Agent struct {
 	provider         provider.Provider
 	programsDir      string
@@ -238,7 +230,7 @@ func (a *Agent) executeTool(call provider.ToolCall) provider.ToolResultMessage {
 	if isError {
 		response = err.Error()
 	}
-	if r := a.readReinforcement(call.Name); r != "" {
+	if r := a.readReinforcement(call); r != "" {
 		response = response + "\n\n" + r
 	}
 	return provider.ToolResultMessage{
@@ -249,12 +241,47 @@ func (a *Agent) executeTool(call provider.ToolCall) provider.ToolResultMessage {
 	}
 }
 
-func (a *Agent) readReinforcement(name string) string {
-	data, err := os.ReadFile(filepath.Join(a.reinforcementDir, name+".md"))
+// readReinforcement executes every program in reinforcement/<tool>/, piping
+// the tool call's argument JSON to each on stdin and exporting
+// $AUTOPROBE_PROGRAMS_DIR. Non-empty stdout from each program is joined with
+// blank lines. Missing tool dirs, missing executables, and program errors
+// silently contribute nothing — the reinforcement layer must never block a
+// tool result.
+func (a *Agent) readReinforcement(call provider.ToolCall) string {
+	dir := filepath.Join(a.reinforcementDir, call.Name)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(os.Expand(string(data), a.expandVar))
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+
+	args := call.Arguments
+	if len(args) == 0 {
+		args = []byte("{}")
+	}
+	env := append(os.Environ(), "AUTOPROBE_PROGRAMS_DIR="+a.programsDir)
+
+	var parts []string
+	for _, name := range names {
+		cmd := exec.Command(filepath.Join(dir, name))
+		cmd.Stdin = bytes.NewReader(args)
+		cmd.Env = env
+		out, runErr := cmd.Output()
+		if runErr != nil {
+			continue
+		}
+		if s := strings.TrimSpace(string(out)); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, error) {
