@@ -114,7 +114,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "shift+tab":
+		case "s":
 			m.stepThrough = !m.stepThrough
 			if !m.stepThrough && m.state == stateReady {
 				m.state = stateRunning
@@ -126,6 +126,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			if len(m.msgViewports) > 0 {
 				m.activeIdx = (m.activeIdx + 1) % len(m.msgViewports)
+				m.refreshContent()
+				m.scrollOuterToActive()
+			}
+			return m, nil
+		case "shift+tab":
+			if len(m.msgViewports) > 0 {
+				m.activeIdx = (m.activeIdx - 1 + len(m.msgViewports)) % len(m.msgViewports)
 				m.refreshContent()
 				m.scrollOuterToActive()
 			}
@@ -238,6 +245,11 @@ func (m *tuiModel) refreshContent() {
 	cw := m.contentWidth()
 
 	prevLen := len(m.msgViewports)
+	// "Following" means the user hasn't tabbed away from the most recent block.
+	// In that case we keep advancing the selection (and scrolling to bottom) as
+	// new blocks arrive. If they've tab-selected an earlier block we leave them
+	// there.
+	following := prevLen == 0 || m.activeIdx == prevLen-1
 	for i := prevLen; i < len(entries); i++ {
 		m.msgViewports = append(m.msgViewports, viewport.New(cw, 1))
 	}
@@ -259,7 +271,7 @@ func (m *tuiModel) refreshContent() {
 		m.msgViewports[i].GotoBottom()
 	}
 
-	if len(m.msgViewports) > prevLen {
+	if following && len(m.msgViewports) > prevLen {
 		m.activeIdx = len(m.msgViewports) - 1
 	}
 	if m.activeIdx >= len(m.msgViewports) {
@@ -267,7 +279,7 @@ func (m *tuiModel) refreshContent() {
 	}
 
 	m.refreshOuter()
-	if len(m.msgViewports) > prevLen {
+	if following && len(m.msgViewports) > prevLen {
 		m.outerVp.GotoBottom()
 	}
 }
@@ -496,8 +508,8 @@ func (m tuiModel) renderFooter() string {
 		mode = "manual"
 	}
 	parts = append(parts,
-		footerKeyStyle.Render("shift+tab")+footerStyle.Render(" "+mode),
-		footerKeyStyle.Render("tab")+footerStyle.Render(" focus next"),
+		footerKeyStyle.Render("s")+footerStyle.Render(" "+mode),
+		footerKeyStyle.Render("tab/shift+tab")+footerStyle.Render(" focus next/prev"),
 		footerKeyStyle.Render("↑/↓")+footerStyle.Render(" scroll"),
 		footerKeyStyle.Render("q")+footerStyle.Render(" quit"),
 	)
