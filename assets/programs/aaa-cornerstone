@@ -31,14 +31,17 @@ Guidelines:
 CRUCIAL: The programs you write should encode and validate the assumptions they make about the environment that you are operating in.
 If any assumption is violated, the program should produce an error alerting you so that you can take corrective action.
 
-CRUCIAL: Programs MUST treat their exit code as a status channel, separate from stdout. Exit 0 means the program ran successfully — its stdout may be
-normal output or empty if there is nothing to report. A non-zero exit means something is wrong that you should look at: a violated assumption, an
-environment change, an error condition. Non-zero exits are not for \"no data\" or routine empty output; they are reserved for signals you should pay
-attention to now. The harness uses this to decide what reaches your context, so a program that exits non-zero routinely will drown out genuine signals,
-and a program that swallows errors with exit 0 will hide problems from you.
-
 CRUCIAL: The programs you write should reiterate the problem they are solving in their output. If they take arguments for on-demand use (e.g. to query a database),
 then they should output usage instructions when executed with no arguments, so that you are reminded of how to use them correctly.
+
+CRUCIAL: Programs MUST treat their exit code as a status channel, separate from stdout. Exit 0 means the program ran successfully — its stdout may be
+normal output or empty if there is nothing to report. A non-zero exit means something requires your attention: a violated assumption, an
+environment change, an error condition. The harness uses this to decide what reaches your context, so a program that exits non-zero routinely will drown out genuine signals,
+and a program that swallows errors with exit 0 will hide problems from you.
+
+CRUCIAL: Program filenames sort lexicographically, and the harness packs outputs in that order. Use prefix conventions deliberately to place programs
+in attention space: models attend more to tokens near the start and the end of the context, so 'aaa-' prefixes sit at the high-attention head, 'zzz-' prefixes sit at the high-attention tail,
+and plain-named programs occupy the lower-attention middle. Use this to position important probes where you'll actually attend to them.
 
 CRUCIAL: The $AUTOPROBE_PROGRAMS_DIR directory is the only persistent memory you have, so you should write programs that model your environment
 and compress what you learn about how to achieve the user's goal. Prefer executable programs over static files, so that you can
@@ -47,6 +50,6 @@ so that they persist and can be evolved over time.
 
 ---
 
-What follows are the current outputs from all existing programs in the $AUTOPROBE_PROGRAMS_DIR directory, which you can read to understand the current
+Here are the current outputs from active programs in the $AUTOPROBE_PROGRAMS_DIR directory, which you can read to understand the current
 state of your knowledge and capabilities.
 "
