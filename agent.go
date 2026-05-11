@@ -125,11 +125,26 @@ func (a *Agent) Step(ctx context.Context) (AssistantMessage, bool, error) {
 	if err != nil {
 		return AssistantMessage{}, false, err
 	}
-	if msg.StopReason == StopMaxTokens {
-		return msg, false, fmt.Errorf("response hit the max_tokens limit; bump the budget in Step")
-	}
 	if msg.StopReason == StopError {
 		return msg, false, fmt.Errorf("provider error: %s", msg.Err)
+	}
+	if msg.StopReason == StopMaxTokens {
+		// The trailing block was likely cut off mid-stream. Tool-call
+		// arguments are JSON and unsafe to execute when partial, so drop
+		// a trailing ToolCall. Truncated text/thinking blocks are kept
+		// as-is — text is still readable, and unsigned thinking is
+		// filtered on replay by the provider layer.
+		if n := len(msg.Content); n > 0 {
+			if _, ok := msg.Content[n-1].(ToolCall); ok {
+				msg.Content = msg.Content[:n-1]
+			}
+		}
+		// If complete tool calls remain, treat the turn as mid-cycle so
+		// the next Step preserves the assistant + tool-result history
+		// and lets the model continue from where it was cut off.
+		if hasToolCall(msg.Content) {
+			msg.StopReason = StopToolUse
+		}
 	}
 	a.iteration++
 	a.lastSent = a.conversation
@@ -154,6 +169,15 @@ func (a *Agent) nextIdleBackoff() time.Duration {
 		}
 	}
 	return a.idleBackoff
+}
+
+func hasToolCall(content []AssistantContent) bool {
+	for _, c := range content {
+		if _, ok := c.(ToolCall); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func conversationsEqual(a, b []Message) bool {
@@ -261,4 +285,3 @@ func (a *Agent) buildConversation(ctx context.Context) ([]Message, error) {
 
 	return []Message{UserMessage{Content: contents}}, nil
 }
-

@@ -211,6 +211,97 @@ func TestStepRebuildsUserMessageWithoutCarryover(t *testing.T) {
 	}
 }
 
+// TestStepMaxTokensDropsTrailingToolCall covers the case where the model
+// hit max_tokens with a partial trailing tool_use block. Its arguments may
+// be malformed JSON, so we must not execute it. With no other tool calls
+// in the message, the turn behaves like StopEnd: the next Step rebuilds
+// from programs alone.
+func TestStepMaxTokensDropsTrailingToolCall(t *testing.T) {
+	t.Parallel()
+	prov := &scriptedProvider{
+		responses: []AssistantMessage{
+			{
+				Content: []AssistantContent{
+					TextContent{Text: "thinking out loud"},
+					bashToolCall("partial", "true"),
+				},
+				StopReason: StopMaxTokens,
+			},
+			{Content: []AssistantContent{TextContent{Text: "fresh start"}}, StopReason: StopEnd},
+		},
+	}
+	a := newTestAgent(t, prov)
+
+	runSteps(t, a, 2)
+
+	// The truncated tool call must not have been executed: no
+	// ToolResultMessage for it should appear in the second call's context.
+	for _, m := range prov.calls[1].Messages {
+		if tr, ok := m.(ToolResultMessage); ok && tr.ToolCallID == "partial" {
+			t.Fatalf("partial tool_use was executed; ToolResultMessage with ID %q leaked into next turn", tr.ToolCallID)
+		}
+	}
+	// With no surviving tool calls, history resets — second call sees
+	// only the freshly built user message.
+	if got := len(prov.calls[1].Messages); got != 1 {
+		t.Fatalf("call 2 messages: got %d (%s), want 1 (history reset)", got, describe(prov.calls[1].Messages))
+	}
+}
+
+// TestStepMaxTokensExecutesCompleteCallsAndPreservesHistory covers the case
+// where the model emitted one or more complete tool_use blocks before
+// max_tokens cut off a trailing partial one. The complete calls must
+// execute, the trailing partial must not, and the turn must continue as
+// a tool-using cycle so the model can see the tool results next Step.
+func TestStepMaxTokensExecutesCompleteCallsAndPreservesHistory(t *testing.T) {
+	t.Parallel()
+	prov := &scriptedProvider{
+		responses: []AssistantMessage{
+			{
+				Content: []AssistantContent{
+					bashToolCall("done", "true"),
+					bashToolCall("partial", "true"),
+				},
+				StopReason: StopMaxTokens,
+			},
+			{Content: []AssistantContent{TextContent{Text: "ok"}}, StopReason: StopEnd},
+		},
+	}
+	a := newTestAgent(t, prov)
+
+	runSteps(t, a, 2)
+
+	// Call 2 must preserve the assistant message (with the partial call
+	// stripped, leaving one ToolCall) and the tool result for "done".
+	msgs := prov.calls[1].Messages
+	if got := len(msgs); got != 3 {
+		t.Fatalf("call 2 messages: got %d (%s), want 3 (user + asst + tool_result)", got, describe(msgs))
+	}
+	asst, ok := msgs[1].(AssistantMessage)
+	if !ok {
+		t.Fatalf("call 2 message 2: got %T, want AssistantMessage", msgs[1])
+	}
+	calls := 0
+	for _, c := range asst.Content {
+		if tc, ok := c.(ToolCall); ok {
+			calls++
+			if tc.ID == "partial" {
+				t.Fatalf("partial tool_use survived into next turn's assistant message")
+			}
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("call 2 assistant message tool calls: got %d, want 1 (the complete one)", calls)
+	}
+	tr, ok := msgs[2].(ToolResultMessage)
+	if !ok {
+		t.Fatalf("call 2 message 3: got %T, want ToolResultMessage", msgs[2])
+	}
+	if tr.ToolCallID != "done" {
+		t.Fatalf("call 2 tool result ID: got %q, want %q", tr.ToolCallID, "done")
+	}
+}
+
 // describe renders a Messages slice as a compact "Type, Type, ..." list,
 // purely for failure diagnostics.
 func describe(msgs []Message) string {
