@@ -44,13 +44,15 @@ Probes MUST treat their exit code as a status channel, separate from stdout:
   they are reserved for "the agent should pay attention to this now."
 
 The harness relies on this convention to decide what's surfaced into the context
-(see [Active set](#active-set-by-exclusion) below). A program that exits non-zero for routine
-conditions will be force-included every iteration, drowning out genuinely
-interesting signals; a program that swallows real errors with exit 0 will be
-selectable out of the context exactly when the agent needs it most.
+(see [Active set](#active-set-by-exclusion) and [Inclusion
+algorithm](#inclusion-algorithm) below). A program that exits non-zero for
+routine conditions will keep promoting itself into the exploration slot every
+iteration, drowning out genuinely interesting signals from other demoted
+programs; a program that swallows real errors with exit 0 will be selectable
+out of the context exactly when the agent needs it most.
 
-The cornerstone and the reinforcement messages on the `write` and `edit` tools
-state this contract so that newly-authored programs conform.
+The cornerstone and the `write` reinforcement state this contract so that
+newly-authored programs conform.
 
 ### Active set (by exclusion)
 
@@ -62,10 +64,14 @@ A program is active iff:
 
 - It is the **cornerstone program** (always active, even if listed in
   `.autoprobe/inactive`), or
-- It exited with a **non-zero exit code** on this iteration (see the exit code
-  contract above — a non-zero exit signals something unexpected and overrides any
-  stale demotion decision), or
 - It is not listed in `.autoprobe/inactive`.
+
+Non-zero exit codes do not change active-set membership. Instead, they bias
+the 20% exploration slot's selection so that inactive programs with non-zero
+exits this iteration are included ahead of random draws (see [Inclusion
+algorithm](#inclusion-algorithm) below). That keeps the active set as a
+deliberate, agent-controlled list, while still honouring the exit code
+contract for alarms from demoted programs.
 
 This means newly-installed programs are active on the very first iteration without
 the agent having to remember to register them, which is the correct default: a
@@ -89,13 +95,80 @@ After all programs have run, the harness builds the context for this iteration:
 2. **If the total fits within the limit**, include every program's output
    unconditionally. No selection, no exploration, no signal lost.
 3. **Otherwise**, allocate the budget in two parts:
-   - **80% to the active set.** Pack active programs' outputs in priority order
-     (cornerstone first, then non-zero-exit programs, then the rest of the active set
-     ordered by descending score — see below) until the 80% allotment is exhausted.
-   - **20% exploration budget** filled from the remaining (inactive) programs chosen
-     uniformly at random. This keeps low-scoring programs measurable so their scores
-     stay fresh, and gives the agent a chance to rediscover programs whose
-     usefulness has changed.
+   - **80% to the active set**, packed in **pure lexicographic order by program
+     name** — exit code does not reorder. The 80% slice is therefore byte-stable
+     across iterations as long as the active programs' outputs don't change,
+     which keeps the provider's prompt cache warm on the bulk of the context.
+     The cornerstone naturally sorts first via the existing `aaa-` naming
+     convention. Active programs that exit non-zero are already guaranteed
+     visibility by being in the active set; promoting them ahead of other
+     active programs would buy a duplicate guarantee at the cost of cache
+     stability whenever alarm sets change.
+   - **20% exploration budget**, filled in two phases:
+     1. **Inactive programs that exited non-zero on this iteration**, in
+        lexicographic order by program name. This is how the exit code contract
+        reaches programs the agent had previously demoted — a previously-quiet
+        probe that has just detected something gets promoted into the context
+        without being subject to the random draw.
+     2. **Random exploration** from the remaining (zero-exit) inactive programs,
+        chosen uniformly, fills any budget left after the non-zero exits. This
+        keeps low-scoring programs measurable so their scores stay fresh, and
+        gives the agent a chance to rediscover programs whose usefulness has
+        changed.
+
+     The exploration slot is at the tail of the context, which lands in the
+     high-attention region of the U-shaped attention curve — appropriate for
+     both promoted alarms and exploration draws.
+
+Scores are not used by the harness to order or select within the active set —
+they are surfaced to the agent in the revision prompt and inform the agent's
+decisions about what to add to `.autoprobe/inactive`. That keeps the harness's
+behavior stable and the agent's involvement explicit.
+
+#### Naming is load-bearing — but for attention, not survival
+
+Lex order serves two distinct purposes that the agent needs to understand
+separately:
+
+- **Attention placement.** Models attend to tokens following a roughly
+  U-shaped curve: tokens near the start and the end of the context get more
+  attention than tokens in the middle ("lost in the middle"). Lex order places
+  `aaa-`-prefixed programs at the high-attention head of the context and
+  `zzz-`-prefixed programs at the high-attention tail; plain-named programs in
+  the middle get less attention. So filename prefixes are how the agent
+  positions a probe in attention space.
+- **Drop order under pressure.** When the active set doesn't fit in 80% of the
+  budget, later-sorting programs get dropped first. This is **not** the
+  primary mechanism for ensuring important probes survive — `.autoprobe/inactive`
+  is. The agent demotes less-valuable programs into `inactive` so that the
+  important ones fit comfortably. Lex order is just the tiebreaker that picks
+  *which* programs get dropped when the active set still overflows.
+
+The two concerns line up neatly: `aaa-` programs sit at the high-attention
+head and are last to be dropped, `zzz-` programs sit at the high-attention
+tail and are first to be dropped, and the agent's main lever for "make sure
+this fits" is `.autoprobe/inactive`, not filename gymnastics.
+
+Active programs that exit non-zero stay in their lex position — they're
+already guaranteed visibility by being in the active set, so they don't need
+to be reordered. Inactive programs that exit non-zero are promoted into the
+20% exploration slot, which sits at the tail of the context (the high-
+attention end of the U-curve). Either way, the alarm reaches the agent at a
+high-attention position without disturbing the byte-stable 80% prefix.
+
+The cornerstone and the `write` reinforcement state this convention so newly-
+authored programs are named with it in mind.
+
+#### Alphabetic clustering
+
+A burst of similarly-prefixed programs (e.g. several `analytics-*` probes
+added at once) can starve later-sorting probes out of the budget without any
+of the analytics programs being individually wasteful. This isn't a separate
+mechanism to design around — it's the same overflow case the rest of the
+design already handles: the dropped probes emit sentinel lines, the revision
+prompt fires (edge-triggered on the first overflow, periodic during sustained
+overflow), and the agent decides which programs to demote into
+`.autoprobe/inactive` so the rest fit comfortably.
 
 Programs whose individual output exceeds the remaining budget for their slot are
 skipped, not truncated — a half-truncated probe is worse than an absent one because
@@ -117,11 +190,15 @@ engages.
 
 The fix is to **decouple the idle check from the selection policy**. Instead of
 comparing the rendered conversation, the harness compares a hash of the
-per-program outputs taken *before* selection — i.e., the raw output of every
-program that ran this iteration, ordered by program name. If those hashes match
-the previous iteration's, the environment is unchanged and the harness idles
-regardless of which random subset the selection policy would have chosen this
-time.
+per-program outputs taken *before* selection — specifically, a hash of
+`(name, exit_code, stdout)` triples for every program that ran this iteration,
+sorted by name. Exit code is part of the hash because a program flipping from
+exit 0 to exit 1 with byte-identical stdout is an environmental change (an
+inactive program just promoted itself into the exploration slot, or an active
+program just raised an alarm) and shouldn't be eaten by idle
+backoff. If those hashes match the previous iteration's, the environment is
+unchanged and the harness idles regardless of which random subset the selection
+policy would have chosen this time.
 
 This separation is also conceptually cleaner: "did the environment change" is a
 property of the programs, not of the rendered context, and shouldn't be coupled to
@@ -186,13 +263,27 @@ harness already computes:
   ticking (high change frequency, low information per change) from a program that
   rarely changes but emits genuinely new information when it does.
 
-  The harness uses a **line-level sequence-matcher ratio**: diff the outputs
-  line-by-line and take `1 - matched_line_fraction`. It is O(n), cheap to
-  compute, and natural for the line-oriented outputs most probes emit. Character-
-  level edit distance (Levenshtein) is the textbook choice but is O(n·m) and
-  works in the wrong unit (characters, not tokens) for this design. If the
-  line-level ratio turns out to be too coarse in practice, token-level n-gram
-  Jaccard is a natural next step — but start simple.
+  The harness uses a **line-level sequence-matcher ratio**, matching Python's
+  `difflib.SequenceMatcher.ratio()`:
+
+  ```
+  similarity = 2 * matched_lines / (len(prev_lines) + len(curr_lines))
+  change     = 1 - similarity
+  ```
+
+  where `matched_lines` is the number of lines in the longest common subsequence
+  between the prior and current outputs. The `2·M / (|A| + |B|)` denominator
+  (sum-of-lengths, not max- or average-) makes the metric symmetric and bounded
+  in `[0, 1]`: identical outputs score 0, fully disjoint outputs score 1, and
+  the result doesn't depend on which output you pass first. Naming the formula
+  explicitly avoids subtly different denominators producing subtly different
+  statistics across implementations or refactors.
+
+  It is O(n), cheap to compute, and natural for the line-oriented outputs most
+  probes emit. Character-level edit distance (Levenshtein) is the textbook
+  choice but is O(n·m) and works in the wrong unit (characters, not tokens) for
+  this design. If the line-level ratio turns out to be too coarse in practice,
+  token-level n-gram Jaccard is a natural next step — but start simple.
 - **Latency.** EWMA of wall-time per execution. Programs that are slow contribute to
   the overall iteration cadence even when their output is cheap in tokens.
 - **Staleness.** Iterations since the output last changed meaningfully. Distinguishes
