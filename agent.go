@@ -14,11 +14,13 @@ import (
 	"time"
 
 	"github.com/comnik/autoprobe/internal/provider"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
-	idleBackoffInitial = 1 * time.Second
-	idleBackoffMax     = 30 * time.Second
+	idleBackoffInitial    = 1 * time.Second
+	idleBackoffMax        = 30 * time.Second
+	maxProgramConcurrency = 8
 )
 
 func NewAgent(prov provider.Provider, root, goal string, debug bool) *Agent {
@@ -270,23 +272,31 @@ func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, erro
 	}
 	sort.Strings(names)
 
-	// Indexed slots, not append, so this can be parallelized later without changing
-	// ordering.
+	// Programs run concurrently into indexed slots so ordering stays
+	// deterministic (sorted by filename) regardless of completion order.
 	outputs := make([][]byte, len(names))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxProgramConcurrency)
 	for i, name := range names {
-		path := filepath.Join(a.programsDir, name)
-		out, runErr := exec.CommandContext(ctx, path).CombinedOutput()
+		g.Go(func() error {
+			path := filepath.Join(a.programsDir, name)
+			out, runErr := exec.CommandContext(gctx, path).CombinedOutput()
 
-		var exitErr *exec.ExitError
-		if runErr != nil && !errors.As(runErr, &exitErr) {
-			return nil, fmt.Errorf("running %s: %w", name, runErr)
-		}
-		exitCode := 0
-		if exitErr != nil {
-			exitCode = exitErr.ExitCode()
-		}
-		header := fmt.Sprintf("[program=%s exit=%d]\n", name, exitCode)
-		outputs[i] = append([]byte(header), out...)
+			var exitErr *exec.ExitError
+			if runErr != nil && !errors.As(runErr, &exitErr) {
+				return fmt.Errorf("running %s: %w", name, runErr)
+			}
+			exitCode := 0
+			if exitErr != nil {
+				exitCode = exitErr.ExitCode()
+			}
+			header := fmt.Sprintf("[program=%s exit=%d]\n", name, exitCode)
+			outputs[i] = append([]byte(header), out...)
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	contents := make([]provider.TextContent, 0, len(outputs)+1)
