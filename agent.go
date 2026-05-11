@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/comnik/autoprobe/internal/provider"
 )
 
 const (
@@ -19,14 +21,14 @@ const (
 	idleBackoffMax     = 30 * time.Second
 )
 
-func NewAgent(provider Provider, root, goal string, debug bool) *Agent {
+func NewAgent(prov provider.Provider, root, goal string, debug bool) *Agent {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
 	programsDir := filepath.Join(root, "programs")
 	reinforcementDir := filepath.Join(root, "reinforcement")
 	return &Agent{
-		provider:         provider,
+		provider:         prov,
 		programsDir:      programsDir,
 		reinforcementDir: reinforcementDir,
 		goal:             goal,
@@ -44,14 +46,14 @@ func (a *Agent) expandVar(name string) string {
 }
 
 type Agent struct {
-	provider         Provider
+	provider         provider.Provider
 	programsDir      string
 	reinforcementDir string
 	goal             string
 	tools            []ToolDefinition
 	debug            bool
 
-	conversation []Message
+	conversation []provider.Message
 	iteration    int
 
 	// Carried across Steps: lastStopReason controls whether the prior
@@ -59,15 +61,15 @@ type Agent struct {
 	// (cycle ended on StopEnd). lastSent is the conversation we last handed
 	// to the provider — when the freshly reconstructed conversation matches
 	// it byte-for-byte, the next Step idles instead of re-querying the model.
-	lastStopReason StopReason
-	lastSent       []Message
+	lastStopReason provider.StopReason
+	lastSent       []provider.Message
 	idleBackoff    time.Duration
 }
 
-func (a *Agent) Conversation() []Message { return a.conversation }
-func (a *Agent) Iteration() int          { return a.iteration }
-func (a *Agent) StepThrough() bool       { return a.debug }
-func (a *Agent) Provider() Provider      { return a.provider }
+func (a *Agent) Conversation() []provider.Message { return a.conversation }
+func (a *Agent) Iteration() int                   { return a.iteration }
+func (a *Agent) StepThrough() bool                { return a.debug }
+func (a *Agent) Provider() provider.Provider      { return a.provider }
 
 func (a *Agent) Run(ctx context.Context) error {
 	return runTUI(ctx, a)
@@ -91,15 +93,15 @@ func (a *Agent) Prime(ctx context.Context) error {
 // and there's no new history), the Step idles with exponential backoff
 // rather than re-querying the model. The agent never auto-terminates —
 // done is always false on success.
-func (a *Agent) Step(ctx context.Context) (AssistantMessage, bool, error) {
+func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, error) {
 	for {
-		var history []Message
-		if a.lastStopReason == StopToolUse && len(a.conversation) > 1 {
+		var history []provider.Message
+		if a.lastStopReason == provider.StopToolUse && len(a.conversation) > 1 {
 			history = append(history, a.conversation[1:]...)
 		}
 		fresh, err := a.buildConversation(ctx)
 		if err != nil {
-			return AssistantMessage{}, false, err
+			return provider.AssistantMessage{}, false, err
 		}
 		a.conversation = append(fresh, history...)
 
@@ -113,29 +115,29 @@ func (a *Agent) Step(ctx context.Context) (AssistantMessage, bool, error) {
 		case <-time.After(d):
 			continue
 		case <-ctx.Done():
-			return AssistantMessage{}, false, ctx.Err()
+			return provider.AssistantMessage{}, false, ctx.Err()
 		}
 	}
 
-	c := Context{
+	c := provider.Context{
 		Messages: a.conversation,
-		Tools:    a.tools,
+		Tools:    a.toolSchemas(),
 	}
-	msg, err := a.provider.Generate(ctx, "", c, Options{MaxTokens: 8192})
+	msg, err := a.provider.Generate(ctx, "", c, provider.Options{MaxTokens: 8192})
 	if err != nil {
-		return AssistantMessage{}, false, err
+		return provider.AssistantMessage{}, false, err
 	}
-	if msg.StopReason == StopError {
+	if msg.StopReason == provider.StopError {
 		return msg, false, fmt.Errorf("provider error: %s", msg.Err)
 	}
-	if msg.StopReason == StopMaxTokens {
+	if msg.StopReason == provider.StopMaxTokens {
 		// The trailing block was likely cut off mid-stream. Tool-call
 		// arguments are JSON and unsafe to execute when partial, so drop
 		// a trailing ToolCall. Truncated text/thinking blocks are kept
 		// as-is — text is still readable, and unsigned thinking is
 		// filtered on replay by the provider layer.
 		if n := len(msg.Content); n > 0 {
-			if _, ok := msg.Content[n-1].(ToolCall); ok {
+			if _, ok := msg.Content[n-1].(provider.ToolCall); ok {
 				msg.Content = msg.Content[:n-1]
 			}
 		}
@@ -143,7 +145,7 @@ func (a *Agent) Step(ctx context.Context) (AssistantMessage, bool, error) {
 		// the next Step preserves the assistant + tool-result history
 		// and lets the model continue from where it was cut off.
 		if hasToolCall(msg.Content) {
-			msg.StopReason = StopToolUse
+			msg.StopReason = provider.StopToolUse
 		}
 	}
 	a.iteration++
@@ -152,11 +154,23 @@ func (a *Agent) Step(ctx context.Context) (AssistantMessage, bool, error) {
 	a.conversation = append(a.conversation, msg)
 
 	for _, c := range msg.Content {
-		if call, ok := c.(ToolCall); ok {
+		if call, ok := c.(provider.ToolCall); ok {
 			a.conversation = append(a.conversation, a.executeTool(call))
 		}
 	}
 	return msg, false, nil
+}
+
+func (a *Agent) toolSchemas() []provider.ToolDefinition {
+	out := make([]provider.ToolDefinition, len(a.tools))
+	for i, t := range a.tools {
+		out[i] = provider.ToolDefinition{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		}
+	}
+	return out
 }
 
 func (a *Agent) nextIdleBackoff() time.Duration {
@@ -171,16 +185,16 @@ func (a *Agent) nextIdleBackoff() time.Duration {
 	return a.idleBackoff
 }
 
-func hasToolCall(content []AssistantContent) bool {
+func hasToolCall(content []provider.AssistantContent) bool {
 	for _, c := range content {
-		if _, ok := c.(ToolCall); ok {
+		if _, ok := c.(provider.ToolCall); ok {
 			return true
 		}
 	}
 	return false
 }
 
-func conversationsEqual(a, b []Message) bool {
+func conversationsEqual(a, b []provider.Message) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -198,7 +212,7 @@ func conversationsEqual(a, b []Message) bool {
 	return bytes.Equal(ja, jb)
 }
 
-func (a *Agent) executeTool(call ToolCall) ToolResultMessage {
+func (a *Agent) executeTool(call provider.ToolCall) provider.ToolResultMessage {
 	var toolDef ToolDefinition
 	var found bool
 	for _, tool := range a.tools {
@@ -209,10 +223,10 @@ func (a *Agent) executeTool(call ToolCall) ToolResultMessage {
 		}
 	}
 	if !found {
-		return ToolResultMessage{
+		return provider.ToolResultMessage{
 			ToolCallID: call.ID,
 			ToolName:   call.Name,
-			Content:    []TextContent{{Text: "tool not found"}},
+			Content:    []provider.TextContent{{Text: "tool not found"}},
 			IsError:    true,
 		}
 	}
@@ -225,10 +239,10 @@ func (a *Agent) executeTool(call ToolCall) ToolResultMessage {
 	if r := a.readReinforcement(call.Name); r != "" {
 		response = response + "\n\n" + r
 	}
-	return ToolResultMessage{
+	return provider.ToolResultMessage{
 		ToolCallID: call.ID,
 		ToolName:   call.Name,
-		Content:    []TextContent{{Text: response}},
+		Content:    []provider.TextContent{{Text: response}},
 		IsError:    isError,
 	}
 }
@@ -241,7 +255,7 @@ func (a *Agent) readReinforcement(name string) string {
 	return strings.TrimSpace(os.Expand(string(data), a.expandVar))
 }
 
-func (a *Agent) buildConversation(ctx context.Context) ([]Message, error) {
+func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, error) {
 	entries, err := os.ReadDir(a.programsDir)
 	if err != nil {
 		return nil, fmt.Errorf("reading programs dir: %w", err)
@@ -275,13 +289,13 @@ func (a *Agent) buildConversation(ctx context.Context) ([]Message, error) {
 		outputs[i] = append([]byte(header), out...)
 	}
 
-	contents := make([]TextContent, 0, len(outputs)+1)
+	contents := make([]provider.TextContent, 0, len(outputs)+1)
 	for _, out := range outputs {
-		contents = append(contents, TextContent{Text: string(out)})
+		contents = append(contents, provider.TextContent{Text: string(out)})
 	}
 	if a.goal != "" {
-		contents = append(contents, TextContent{Text: "[YOUR GOAL]\n" + a.goal})
+		contents = append(contents, provider.TextContent{Text: "[YOUR GOAL]\n" + a.goal})
 	}
 
-	return []Message{UserMessage{Content: contents}}, nil
+	return []provider.Message{provider.UserMessage{Content: contents}}, nil
 }

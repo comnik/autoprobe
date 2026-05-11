@@ -1,4 +1,8 @@
-package main
+// Package provider abstracts the model APIs autoprobe talks to (Anthropic,
+// OpenAI, Google, xAI). Each provider translates the neutral Context shape
+// to/from its native SDK, preserving signature fields so multi-turn
+// reasoning round-trips.
+package provider
 
 import (
 	"context"
@@ -9,8 +13,8 @@ import (
 type Role string
 
 const (
-	RoleUser      Role = "user"
-	RoleAssistant Role = "assistant"
+	RoleUser       Role = "user"
+	RoleAssistant  Role = "assistant"
 	RoleToolResult Role = "tool_result"
 )
 
@@ -118,6 +122,15 @@ type Usage struct {
 	OutputTokens int
 }
 
+// ToolDefinition is the schema view of a tool that providers translate into
+// their native function-calling format. The agent owns the actual handler;
+// the provider only needs the schema.
+type ToolDefinition struct {
+	Name        string
+	Description string
+	Parameters  map[string]any // JSON Schema; each provider translates to its native shape
+}
+
 // Context is what the provider sees for one Generate call: the system
 // prompt, the running conversation, and the tools the model may call.
 type Context struct {
@@ -132,11 +145,30 @@ type Options struct {
 	MaxTokens int
 }
 
-// Provider is the abstraction over Anthropic / OpenAI / Google. Provider
-// implementations translate Context to/from their native SDK shapes,
+// Provider is the abstraction over Anthropic / OpenAI / Google / xAI.
+// Implementations translate Context to/from their native SDK shapes,
 // preserving signature fields so multi-turn reasoning round-trips.
 type Provider interface {
 	Name() string
 	DefaultModel() string
 	Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error)
+}
+
+// JoinText concatenates the Text fields of content with newlines. Exposed
+// for callers (renderers, tests) that operate on TextContent slices.
+func JoinText(content []TextContent) string {
+	if len(content) == 0 {
+		return ""
+	}
+	if len(content) == 1 {
+		return content[0].Text
+	}
+	var b []byte
+	for i, c := range content {
+		if i > 0 {
+			b = append(b, '\n')
+		}
+		b = append(b, c.Text...)
+	}
+	return string(b)
 }

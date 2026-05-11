@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/comnik/autoprobe/internal/provider"
 )
 
 //go:embed all:assets
@@ -209,16 +211,16 @@ func cmdRun(args []string) error {
 	return agent.Run(context.TODO())
 }
 
-func buildProvider(name, model string) (Provider, error) {
+func buildProvider(name, model string) (provider.Provider, error) {
 	switch name {
 	case "anthropic", "":
-		return NewAnthropicProvider(model), nil
+		return provider.NewAnthropic(model), nil
 	case "openai":
-		return NewOpenAIProvider(model), nil
+		return provider.NewOpenAI(model), nil
 	case "google":
-		return NewGoogleProvider(model)
+		return provider.NewGoogle(model)
 	case "grok":
-		return NewGrokProvider(model), nil
+		return provider.NewGrok(model), nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q (expected anthropic, openai, google, or grok)", name)
 	}

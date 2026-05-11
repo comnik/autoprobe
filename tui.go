@@ -9,6 +9,8 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/comnik/autoprobe/internal/provider"
 )
 
 const (
@@ -181,45 +183,45 @@ func (m tuiModel) contentWidth() int {
 // piece of an assistant message (text/thinking/toolCall), a piece of a user
 // message (text), or a tool result.
 type blockEntry struct {
-	role Role
+	role provider.Role
 
 	// At most one of these is non-nil.
-	userText   *TextContent
-	asstText   *TextContent
-	thinking   *ThinkingContent
-	toolCall   *ToolCall
-	toolResult *ToolResultMessage
+	userText   *provider.TextContent
+	asstText   *provider.TextContent
+	thinking   *provider.ThinkingContent
+	toolCall   *provider.ToolCall
+	toolResult *provider.ToolResultMessage
 }
 
 func (e blockEntry) isAssistantText() bool { return e.asstText != nil }
 func (e blockEntry) isUserText() bool      { return e.userText != nil }
 
-func collectBlocks(conversation []Message) []blockEntry {
+func collectBlocks(conversation []provider.Message) []blockEntry {
 	var entries []blockEntry
 	for _, msg := range conversation {
 		switch m := msg.(type) {
-		case UserMessage:
+		case provider.UserMessage:
 			for i := range m.Content {
 				c := m.Content[i]
-				entries = append(entries, blockEntry{role: RoleUser, userText: &c})
+				entries = append(entries, blockEntry{role: provider.RoleUser, userText: &c})
 			}
-		case AssistantMessage:
+		case provider.AssistantMessage:
 			for _, c := range m.Content {
 				switch c := c.(type) {
-				case TextContent:
+				case provider.TextContent:
 					t := c
-					entries = append(entries, blockEntry{role: RoleAssistant, asstText: &t})
-				case ThinkingContent:
+					entries = append(entries, blockEntry{role: provider.RoleAssistant, asstText: &t})
+				case provider.ThinkingContent:
 					th := c
-					entries = append(entries, blockEntry{role: RoleAssistant, thinking: &th})
-				case ToolCall:
+					entries = append(entries, blockEntry{role: provider.RoleAssistant, thinking: &th})
+				case provider.ToolCall:
 					tc := c
-					entries = append(entries, blockEntry{role: RoleAssistant, toolCall: &tc})
+					entries = append(entries, blockEntry{role: provider.RoleAssistant, toolCall: &tc})
 				}
 			}
-		case ToolResultMessage:
+		case provider.ToolResultMessage:
 			tr := m
-			entries = append(entries, blockEntry{role: RoleToolResult, toolResult: &tr})
+			entries = append(entries, blockEntry{role: provider.RoleToolResult, toolResult: &tr})
 		}
 	}
 	return entries
@@ -546,7 +548,7 @@ func renderBlock(entry blockEntry, width int) string {
 		combined := toolNameStyle.Render("→ "+entry.toolCall.Name) + toolUseStyle.Render("("+input+")")
 		return lipgloss.NewStyle().Width(width).Render(combined)
 	case entry.toolResult != nil:
-		text := joinText(entry.toolResult.Content)
+		text := provider.JoinText(entry.toolResult.Content)
 		label := "← result:"
 		style := toolOkStyle
 		if entry.toolResult.IsError {

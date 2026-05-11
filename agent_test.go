@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/comnik/autoprobe/internal/provider"
 )
 
 // scriptedProvider is a Provider that replays a fixed sequence of
@@ -15,26 +17,26 @@ import (
 // invocation. The recorded contexts let tests assert exactly what the
 // agent sent to the model on each iteration.
 type scriptedProvider struct {
-	responses []AssistantMessage
-	calls     []Context
+	responses []provider.AssistantMessage
+	calls     []provider.Context
 }
 
 func (p *scriptedProvider) Name() string         { return "scripted" }
 func (p *scriptedProvider) DefaultModel() string { return "test-model" }
 
-func (p *scriptedProvider) Generate(_ context.Context, _ string, c Context, _ Options) (AssistantMessage, error) {
+func (p *scriptedProvider) Generate(_ context.Context, _ string, c provider.Context, _ provider.Options) (provider.AssistantMessage, error) {
 	// Snapshot the messages slice so subsequent mutations of a.conversation
 	// can't change what we captured.
-	snap := make([]Message, len(c.Messages))
+	snap := make([]provider.Message, len(c.Messages))
 	copy(snap, c.Messages)
-	p.calls = append(p.calls, Context{
+	p.calls = append(p.calls, provider.Context{
 		SystemPrompt: c.SystemPrompt,
 		Messages:     snap,
 		Tools:        c.Tools,
 	})
 	idx := len(p.calls) - 1
 	if idx >= len(p.responses) {
-		return AssistantMessage{}, fmt.Errorf("scriptedProvider: no scripted response for call %d", idx+1)
+		return provider.AssistantMessage{}, fmt.Errorf("scriptedProvider: no scripted response for call %d", idx+1)
 	}
 	return p.responses[idx], nil
 }
@@ -51,7 +53,7 @@ echo "$N" > "$COUNT_FILE"
 echo "step=$N"
 `
 
-func newTestAgent(t *testing.T, prov Provider) *Agent {
+func newTestAgent(t *testing.T, prov provider.Provider) *Agent {
 	t.Helper()
 	root := t.TempDir()
 	progDir := filepath.Join(root, "programs")
@@ -67,9 +69,9 @@ func newTestAgent(t *testing.T, prov Provider) *Agent {
 	return NewAgent(prov, root, "", false)
 }
 
-func bashToolCall(id, cmd string) ToolCall {
+func bashToolCall(id, cmd string) provider.ToolCall {
 	args, _ := json.Marshal(map[string]string{"command": cmd})
-	return ToolCall{ID: id, Name: "bash", Arguments: args}
+	return provider.ToolCall{ID: id, Name: "bash", Arguments: args}
 }
 
 // runSteps drives Step n times, failing fast on errors or premature
@@ -91,10 +93,10 @@ func runSteps(t *testing.T, a *Agent, n int) {
 func TestStepKeepsHistoryAcrossToolUseCycle(t *testing.T) {
 	t.Parallel()
 	prov := &scriptedProvider{
-		responses: []AssistantMessage{
-			{Content: []AssistantContent{bashToolCall("c1", "true")}, StopReason: StopToolUse},
-			{Content: []AssistantContent{bashToolCall("c2", "true")}, StopReason: StopToolUse},
-			{Content: []AssistantContent{TextContent{Text: "done"}}, StopReason: StopEnd},
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
+			{Content: []provider.AssistantContent{bashToolCall("c2", "true")}, StopReason: provider.StopToolUse},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "done"}}, StopReason: provider.StopEnd},
 		},
 	}
 	a := newTestAgent(t, prov)
@@ -118,22 +120,22 @@ func TestStepKeepsHistoryAcrossToolUseCycle(t *testing.T) {
 	// reflecting the latest program run (counter step=i+1), not a recycled
 	// one from Prime or a prior Step.
 	for i, c := range prov.calls {
-		u, ok := c.Messages[0].(UserMessage)
+		u, ok := c.Messages[0].(provider.UserMessage)
 		if !ok {
 			t.Fatalf("call %d: first message is %T, want UserMessage", i+1, c.Messages[0])
 		}
 		want := fmt.Sprintf("step=%d", i+1)
-		if got := joinText(u.Content); !strings.Contains(got, want) {
+		if got := provider.JoinText(u.Content); !strings.Contains(got, want) {
 			t.Fatalf("call %d: user message missing %q (got %q)", i+1, want, got)
 		}
 	}
 
 	// Within the tool cycle, the assistant + tool-result blocks from
 	// earlier Steps must survive verbatim into later calls.
-	if _, ok := prov.calls[1].Messages[1].(AssistantMessage); !ok {
+	if _, ok := prov.calls[1].Messages[1].(provider.AssistantMessage); !ok {
 		t.Fatalf("call 2 message 2: got %T, want AssistantMessage from Step 1", prov.calls[1].Messages[1])
 	}
-	if _, ok := prov.calls[1].Messages[2].(ToolResultMessage); !ok {
+	if _, ok := prov.calls[1].Messages[2].(provider.ToolResultMessage); !ok {
 		t.Fatalf("call 2 message 3: got %T, want ToolResultMessage from Step 1", prov.calls[1].Messages[2])
 	}
 }
@@ -141,9 +143,9 @@ func TestStepKeepsHistoryAcrossToolUseCycle(t *testing.T) {
 func TestStepResetsHistoryAfterStopEnd(t *testing.T) {
 	t.Parallel()
 	prov := &scriptedProvider{
-		responses: []AssistantMessage{
-			{Content: []AssistantContent{TextContent{Text: "first turn"}}, StopReason: StopEnd},
-			{Content: []AssistantContent{TextContent{Text: "second turn"}}, StopReason: StopEnd},
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "first turn"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "second turn"}}, StopReason: provider.StopEnd},
 		},
 	}
 	a := newTestAgent(t, prov)
@@ -159,7 +161,7 @@ func TestStepResetsHistoryAfterStopEnd(t *testing.T) {
 	if got := len(prov.calls[1].Messages); got != 1 {
 		t.Fatalf("call 2 messages: got %d, want 1 (history reset after StopEnd)", got)
 	}
-	if _, ok := prov.calls[1].Messages[0].(UserMessage); !ok {
+	if _, ok := prov.calls[1].Messages[0].(provider.UserMessage); !ok {
 		t.Fatalf("call 2 first message is %T, want UserMessage", prov.calls[1].Messages[0])
 	}
 }
@@ -173,9 +175,9 @@ func TestStepResetsHistoryAfterStopEnd(t *testing.T) {
 func TestStepRebuildsUserMessageWithoutCarryover(t *testing.T) {
 	t.Parallel()
 	prov := &scriptedProvider{
-		responses: []AssistantMessage{
-			{Content: []AssistantContent{TextContent{Text: "first"}}, StopReason: StopEnd},
-			{Content: []AssistantContent{TextContent{Text: "second"}}, StopReason: StopEnd},
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "first"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "second"}}, StopReason: provider.StopEnd},
 		},
 	}
 	a := newTestAgent(t, prov)
@@ -202,11 +204,11 @@ func TestStepRebuildsUserMessageWithoutCarryover(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("call 2 messages: got %d (%s), want 1 fresh UserMessage", len(got), describe(got))
 	}
-	u, ok := got[0].(UserMessage)
+	u, ok := got[0].(provider.UserMessage)
 	if !ok {
 		t.Fatalf("call 2 first message is %T (%s), want UserMessage", got[0], describe(got))
 	}
-	if text := joinText(u.Content); !strings.Contains(text, "step=2") {
+	if text := provider.JoinText(u.Content); !strings.Contains(text, "step=2") {
 		t.Fatalf("call 2 user message missing step=2 (programs not re-run between Steps?): %q", text)
 	}
 }
@@ -219,15 +221,15 @@ func TestStepRebuildsUserMessageWithoutCarryover(t *testing.T) {
 func TestStepMaxTokensDropsTrailingToolCall(t *testing.T) {
 	t.Parallel()
 	prov := &scriptedProvider{
-		responses: []AssistantMessage{
+		responses: []provider.AssistantMessage{
 			{
-				Content: []AssistantContent{
-					TextContent{Text: "thinking out loud"},
+				Content: []provider.AssistantContent{
+					provider.TextContent{Text: "thinking out loud"},
 					bashToolCall("partial", "true"),
 				},
-				StopReason: StopMaxTokens,
+				StopReason: provider.StopMaxTokens,
 			},
-			{Content: []AssistantContent{TextContent{Text: "fresh start"}}, StopReason: StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "fresh start"}}, StopReason: provider.StopEnd},
 		},
 	}
 	a := newTestAgent(t, prov)
@@ -237,7 +239,7 @@ func TestStepMaxTokensDropsTrailingToolCall(t *testing.T) {
 	// The truncated tool call must not have been executed: no
 	// ToolResultMessage for it should appear in the second call's context.
 	for _, m := range prov.calls[1].Messages {
-		if tr, ok := m.(ToolResultMessage); ok && tr.ToolCallID == "partial" {
+		if tr, ok := m.(provider.ToolResultMessage); ok && tr.ToolCallID == "partial" {
 			t.Fatalf("partial tool_use was executed; ToolResultMessage with ID %q leaked into next turn", tr.ToolCallID)
 		}
 	}
@@ -256,15 +258,15 @@ func TestStepMaxTokensDropsTrailingToolCall(t *testing.T) {
 func TestStepMaxTokensExecutesCompleteCallsAndPreservesHistory(t *testing.T) {
 	t.Parallel()
 	prov := &scriptedProvider{
-		responses: []AssistantMessage{
+		responses: []provider.AssistantMessage{
 			{
-				Content: []AssistantContent{
+				Content: []provider.AssistantContent{
 					bashToolCall("done", "true"),
 					bashToolCall("partial", "true"),
 				},
-				StopReason: StopMaxTokens,
+				StopReason: provider.StopMaxTokens,
 			},
-			{Content: []AssistantContent{TextContent{Text: "ok"}}, StopReason: StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "ok"}}, StopReason: provider.StopEnd},
 		},
 	}
 	a := newTestAgent(t, prov)
@@ -277,13 +279,13 @@ func TestStepMaxTokensExecutesCompleteCallsAndPreservesHistory(t *testing.T) {
 	if got := len(msgs); got != 3 {
 		t.Fatalf("call 2 messages: got %d (%s), want 3 (user + asst + tool_result)", got, describe(msgs))
 	}
-	asst, ok := msgs[1].(AssistantMessage)
+	asst, ok := msgs[1].(provider.AssistantMessage)
 	if !ok {
 		t.Fatalf("call 2 message 2: got %T, want AssistantMessage", msgs[1])
 	}
 	calls := 0
 	for _, c := range asst.Content {
-		if tc, ok := c.(ToolCall); ok {
+		if tc, ok := c.(provider.ToolCall); ok {
 			calls++
 			if tc.ID == "partial" {
 				t.Fatalf("partial tool_use survived into next turn's assistant message")
@@ -293,7 +295,7 @@ func TestStepMaxTokensExecutesCompleteCallsAndPreservesHistory(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("call 2 assistant message tool calls: got %d, want 1 (the complete one)", calls)
 	}
-	tr, ok := msgs[2].(ToolResultMessage)
+	tr, ok := msgs[2].(provider.ToolResultMessage)
 	if !ok {
 		t.Fatalf("call 2 message 3: got %T, want ToolResultMessage", msgs[2])
 	}
@@ -304,7 +306,7 @@ func TestStepMaxTokensExecutesCompleteCallsAndPreservesHistory(t *testing.T) {
 
 // describe renders a Messages slice as a compact "Type, Type, ..." list,
 // purely for failure diagnostics.
-func describe(msgs []Message) string {
+func describe(msgs []provider.Message) string {
 	parts := make([]string, len(msgs))
 	for i, m := range msgs {
 		parts[i] = fmt.Sprintf("%T", m)
@@ -315,10 +317,10 @@ func describe(msgs []Message) string {
 func TestStepMixedCycleResetsOnlyAfterStopEnd(t *testing.T) {
 	t.Parallel()
 	prov := &scriptedProvider{
-		responses: []AssistantMessage{
-			{Content: []AssistantContent{bashToolCall("c1", "true")}, StopReason: StopToolUse},
-			{Content: []AssistantContent{TextContent{Text: "wrapping up"}}, StopReason: StopEnd},
-			{Content: []AssistantContent{bashToolCall("c2", "true")}, StopReason: StopToolUse},
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "wrapping up"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{bashToolCall("c2", "true")}, StopReason: provider.StopToolUse},
 		},
 	}
 	a := newTestAgent(t, prov)

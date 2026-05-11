@@ -1,4 +1,4 @@
-package main
+package provider
 
 import (
 	"context"
@@ -9,16 +9,16 @@ import (
 	"google.golang.org/genai"
 )
 
-// GoogleProvider talks to Gemini via google.golang.org/genai. The neutral
+// Google talks to Gemini via google.golang.org/genai. The neutral
 // ToolCall.ThoughtSignature carries Gemini's per-call thoughtSignature
 // (base64-encoded so it round-trips through a string), letting Gemini reuse
 // its thought context across turns.
-type GoogleProvider struct {
+type Google struct {
 	client *genai.Client
 	model  string
 }
 
-func NewGoogleProvider(model string) (*GoogleProvider, error) {
+func NewGoogle(model string) (*Google, error) {
 	apiKey := envLookup("GEMINI_API_KEY")
 	if apiKey == "" {
 		apiKey = envLookup("GOOGLE_API_KEY")
@@ -31,13 +31,13 @@ func NewGoogleProvider(model string) (*GoogleProvider, error) {
 	if model == "" {
 		model = "gemini-2.5-pro"
 	}
-	return &GoogleProvider{client: c, model: model}, nil
+	return &Google{client: c, model: model}, nil
 }
 
-func (p *GoogleProvider) Name() string         { return "google" }
-func (p *GoogleProvider) DefaultModel() string { return p.model }
+func (p *Google) Name() string         { return "google" }
+func (p *Google) DefaultModel() string { return p.model }
 
-func (p *GoogleProvider) Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error) {
+func (p *Google) Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error) {
 	if model == "" {
 		model = p.model
 	}
@@ -209,7 +209,7 @@ func buildGoogleContents(msgs []Message) ([]*genai.Content, error) {
 					FunctionResponse: &genai.FunctionResponse{
 						ID:       tr.ToolCallID,
 						Name:     tr.ToolName,
-						Response: map[string]any{"output": joinText(tr.Content), "isError": tr.IsError},
+						Response: map[string]any{"output": JoinText(tr.Content), "isError": tr.IsError},
 					},
 				})
 			}

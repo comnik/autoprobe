@@ -1,4 +1,4 @@
-package main
+package provider
 
 import (
 	"context"
@@ -7,23 +7,23 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
-type AnthropicProvider struct {
+type Anthropic struct {
 	client *anthropic.Client
 	model  string
 }
 
-func NewAnthropicProvider(model string) *AnthropicProvider {
+func NewAnthropic(model string) *Anthropic {
 	c := anthropic.NewClient()
 	if model == "" {
 		model = string(anthropic.ModelClaudeOpus4_7)
 	}
-	return &AnthropicProvider{client: &c, model: model}
+	return &Anthropic{client: &c, model: model}
 }
 
-func (p *AnthropicProvider) Name() string         { return "anthropic" }
-func (p *AnthropicProvider) DefaultModel() string { return p.model }
+func (p *Anthropic) Name() string         { return "anthropic" }
+func (p *Anthropic) DefaultModel() string { return p.model }
 
-func (p *AnthropicProvider) Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error) {
+func (p *Anthropic) Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error) {
 	if model == "" {
 		model = p.model
 	}
@@ -172,7 +172,7 @@ func buildAnthropicMessages(msgs []Message) ([]anthropic.MessageParam, error) {
 					i--
 					break
 				}
-				body := joinText(tr.Content)
+				body := JoinText(tr.Content)
 				blocks = append(blocks, anthropic.NewToolResultBlock(tr.ToolCallID, body, tr.IsError))
 			}
 			out = append(out, anthropic.NewUserMessage(blocks...))
@@ -183,21 +183,4 @@ func buildAnthropicMessages(msgs []Message) ([]anthropic.MessageParam, error) {
 	}
 
 	return out, nil
-}
-
-func joinText(content []TextContent) string {
-	if len(content) == 0 {
-		return ""
-	}
-	if len(content) == 1 {
-		return content[0].Text
-	}
-	var b []byte
-	for i, c := range content {
-		if i > 0 {
-			b = append(b, '\n')
-		}
-		b = append(b, c.Text...)
-	}
-	return string(b)
 }

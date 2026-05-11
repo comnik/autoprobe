@@ -1,4 +1,4 @@
-package main
+package provider
 
 import (
 	"context"
@@ -13,16 +13,16 @@ import (
 
 const grokBaseURL = "https://api.x.ai/v1"
 
-// GrokProvider talks to xAI via the OpenAI-compatible Chat Completions
-// endpoint at https://api.x.ai/v1. xAI's reasoning_content is not signed for
-// replay, so reasoning is dropped between turns — the agent loop tolerates
-// this the same way it does for non-extended-thinking Anthropic.
-type GrokProvider struct {
+// Grok talks to xAI via the OpenAI-compatible Chat Completions endpoint at
+// https://api.x.ai/v1. xAI's reasoning_content is not signed for replay, so
+// reasoning is dropped between turns — the agent loop tolerates this the
+// same way it does for non-extended-thinking Anthropic.
+type Grok struct {
 	client *openai.Client
 	model  string
 }
 
-func NewGrokProvider(model string) *GrokProvider {
+func NewGrok(model string) *Grok {
 	c := openai.NewClient(
 		option.WithAPIKey(getGrokKey()),
 		option.WithBaseURL(grokBaseURL),
@@ -30,7 +30,7 @@ func NewGrokProvider(model string) *GrokProvider {
 	if model == "" {
 		model = "grok-4"
 	}
-	return &GrokProvider{client: &c, model: model}
+	return &Grok{client: &c, model: model}
 }
 
 func getGrokKey() string {
@@ -42,10 +42,10 @@ func getGrokKey() string {
 	return ""
 }
 
-func (p *GrokProvider) Name() string         { return "grok" }
-func (p *GrokProvider) DefaultModel() string { return p.model }
+func (p *Grok) Name() string         { return "grok" }
+func (p *Grok) DefaultModel() string { return p.model }
 
-func (p *GrokProvider) Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error) {
+func (p *Grok) Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error) {
 	if model == "" {
 		model = p.model
 	}
@@ -138,7 +138,7 @@ func buildGrokMessages(systemPrompt string, msgs []Message) ([]openai.ChatComple
 	for _, m := range msgs {
 		switch m := m.(type) {
 		case UserMessage:
-			text := joinText(m.Content)
+			text := JoinText(m.Content)
 			if text == "" {
 				continue
 			}
@@ -181,7 +181,7 @@ func buildGrokMessages(systemPrompt string, msgs []Message) ([]openai.ChatComple
 			out = append(out, openai.ChatCompletionMessageParamUnion{OfAssistant: &asst})
 
 		case ToolResultMessage:
-			out = append(out, openai.ToolMessage(joinText(m.Content), m.ToolCallID))
+			out = append(out, openai.ToolMessage(JoinText(m.Content), m.ToolCallID))
 
 		default:
 			return nil, fmt.Errorf("unsupported message type %T", m)

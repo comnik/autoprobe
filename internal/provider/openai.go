@@ -1,4 +1,4 @@
-package main
+package provider
 
 import (
 	"context"
@@ -13,22 +13,22 @@ import (
 	"github.com/openai/openai-go/shared/constant"
 )
 
-// OpenAIProvider talks to OpenAI's Responses API. Reasoning round-trip is
-// achieved by sending Include=["reasoning.encrypted_content"] on every call
-// and replaying each reasoning item with its id, summary, and
-// encrypted_content on the next turn. The neutral ThinkingSignature carries
+// OpenAI talks to OpenAI's Responses API. Reasoning round-trip is achieved
+// by sending Include=["reasoning.encrypted_content"] on every call and
+// replaying each reasoning item with its id, summary, and encrypted_content
+// on the next turn. The neutral ThinkingSignature carries
 // "<id>|<encrypted_content>".
-type OpenAIProvider struct {
+type OpenAI struct {
 	client *openai.Client
 	model  string
 }
 
-func NewOpenAIProvider(model string) *OpenAIProvider {
+func NewOpenAI(model string) *OpenAI {
 	c := openai.NewClient(option.WithAPIKey(getOpenAIKey()))
 	if model == "" {
 		model = "gpt-5-codex"
 	}
-	return &OpenAIProvider{client: &c, model: model}
+	return &OpenAI{client: &c, model: model}
 }
 
 func getOpenAIKey() string {
@@ -40,10 +40,10 @@ func getOpenAIKey() string {
 	return ""
 }
 
-func (p *OpenAIProvider) Name() string         { return "openai" }
-func (p *OpenAIProvider) DefaultModel() string { return p.model }
+func (p *OpenAI) Name() string         { return "openai" }
+func (p *OpenAI) DefaultModel() string { return p.model }
 
-func (p *OpenAIProvider) Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error) {
+func (p *OpenAI) Generate(ctx context.Context, model string, c Context, opts Options) (AssistantMessage, error) {
 	if model == "" {
 		model = p.model
 	}
@@ -177,7 +177,7 @@ func buildOpenAIInput(msgs []Message) (responses.ResponseInputParam, error) {
 	for _, m := range msgs {
 		switch m := m.(type) {
 		case UserMessage:
-			text := joinText(m.Content)
+			text := JoinText(m.Content)
 			if text == "" {
 				continue
 			}
@@ -215,7 +215,7 @@ func buildOpenAIInput(msgs []Message) (responses.ResponseInputParam, error) {
 			}
 
 		case ToolResultMessage:
-			out = append(out, responses.ResponseInputItemParamOfFunctionCallOutput(m.ToolCallID, joinText(m.Content)))
+			out = append(out, responses.ResponseInputItemParamOfFunctionCallOutput(m.ToolCallID, JoinText(m.Content)))
 
 		default:
 			return nil, fmt.Errorf("unsupported message type %T", m)
