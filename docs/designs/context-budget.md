@@ -14,12 +14,22 @@
   always-active special case was removed from the design during
   implementation; the `aaa-cornerstone` asset still ships the convention
   text but is otherwise a normal program.
-- **Not yet implemented**: per-program statistics — both the cheap
-  always-on metrics (avg tokens, change frequency, line-level diff ratio,
-  latency, staleness, overlap-with-response) and the sampled causal-
-  influence ablation. The `.autoprobe/statistics` file does not exist yet,
-  and the revision prompt does not surface per-program metrics. Tracking
-  in [statistics follow-up](#per-program-statistics).
+- **2026-05-12** (statistics follow-up): Cheap always-on per-program
+  metrics landed. AvgOutputTokens, ChangeFrequency, AvgChangeAmount
+  (line-level LCS ratio), AvgLatencyMs, Staleness, OverlapWithResponse
+  (word-trigram recall against the assistant turn), and Samples are
+  computed every substantive iteration and persisted to
+  `.autoprobe/statistics/<program>.json` — one file per program rather
+  than the single-file format the open questions section originally
+  tentatively favored, so workers can read/write in parallel with no
+  shared map. The revision script globs that directory and renders a
+  ranked table inline with the prompt; programs are ordered ascending by
+  `(avg_change_amount + overlap_with_response) / 2` so the bottom-k
+  appear as deactivation candidates.
+- **Not yet implemented**: sampled causal-influence ablation. Requires
+  provider-level logprob scoring and only works on OpenAI / xAI / local
+  open-weight models, so it's deferred until the provider interface is
+  extended.
 
 ## Problem
 
@@ -258,10 +268,10 @@ below.
 
 ## Per-program statistics
 
-Statistics are persisted in `.autoprobe/statistics` (one record per program, format
-TBD — likely line-delimited JSON keyed by program name). They are updated incrementally
-as each iteration runs and exposed to the agent on demand (and unconditionally as part
-of the revision prompt).
+Statistics are persisted in `.autoprobe/statistics/<program>.json` — one JSON file per
+program. They are updated incrementally after every substantive iteration and exposed to
+the agent on demand (the revision script globs the directory and renders a ranked table
+inline with the prompt, and the agent may also read individual files directly).
 
 ### Cheap always-on metrics
 
@@ -383,14 +393,16 @@ renewed value.
   explicitly demoted. Edited by the agent. The file is allowed to be missing or
   empty; in that case, every program is active. Entries naming programs that no
   longer exist are ignored.
-- `.autoprobe/statistics` — per-program metrics, updated by the harness every
-  iteration. Read-only from the agent's perspective; surfaced into the context on
-  demand and as part of the revision prompt.
+- `.autoprobe/statistics/` — one JSON file per program (`<name>.json`),
+  written by the harness on every substantive iteration. Read-only from
+  the agent's perspective; the revision script globs this directory and
+  renders the ranked table inline with the prompt, and the agent may also
+  read individual files via the read tool. Per-program files let the
+  parallel updater write each program's record independently with no
+  shared map and no serial merge step; one corrupt file only loses that
+  program's history rather than the whole library's.
 
 ## Open questions
 
 - **Pair-ablation budget.** Worth doing occasionally to detect redundant programs,
   but expensive. Likely a follow-up once the single-program flow is in place.
-- **Statistics file format.** JSON-lines is easy to append and easy for programs to
-  read, but a small SQLite database would make per-program updates atomic and queries
-  cheap. Defer until the access patterns are clearer.

@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROBE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PROGRAMS_DIR="$PROBE_DIR/programs"
 INACTIVE="$PROBE_DIR/inactive"
+STATS_DIR="$PROBE_DIR/statistics"
 
 cat <<EOF
 [REVISION]
@@ -39,3 +40,72 @@ Do two things now:
    exist, append a program's filename to demote it, remove the line later to
    promote it back. Nothing is destroyed.
 EOF
+
+# Statistics block. Each program has its own JSON file under
+# $STATS_DIR/<name>.json — the harness writes them in parallel during the
+# substantive-iteration finalize step. We glob the directory and let
+# python merge them in-memory for ranking; a missing/empty directory just
+# suppresses this section. Programs are sorted ascending by a composite
+# of change-information-content + overlap-with-response so the least
+# valuable rows surface at the top of the table and at the bottom-k
+# callout — those are the agent's first candidates for $INACTIVE.
+if [ -d "$STATS_DIR" ]; then
+    if rendered=$(python3 - "$STATS_DIR" 2>/dev/null <<'PY'
+import json, os, sys
+
+stats_dir = sys.argv[1]
+data = {}
+try:
+    entries = sorted(os.listdir(stats_dir))
+except OSError:
+    sys.exit(1)
+for fname in entries:
+    if not fname.endswith(".json"):
+        continue
+    name = fname[:-len(".json")]
+    try:
+        with open(os.path.join(stats_dir, fname)) as f:
+            data[name] = json.load(f)
+    except Exception:
+        continue
+if not data:
+    sys.exit(0)
+
+def composite(s):
+    return (s.get("avg_change_amount", 0.0) + s.get("overlap_with_response", 0.0)) / 2
+
+rows = sorted(((composite(s), name, s) for name, s in data.items()))
+
+print()
+print("[STATISTICS]")
+print("Per-program metrics (EWMA over recent iterations; lowest composite first):")
+print()
+hdr = f"{'name':<32} {'tokens':>8} {'chg-frq':>8} {'chg-amt':>8} {'ovlp':>6} {'stale':>6} {'lat-ms':>8} {'n':>5}"
+print(hdr)
+print("-" * len(hdr))
+for _, name, s in rows:
+    print(
+        f"{name:<32.32} "
+        f"{s.get('avg_output_tokens', 0):>8.0f} "
+        f"{s.get('change_frequency', 0):>8.2f} "
+        f"{s.get('avg_change_amount', 0):>8.2f} "
+        f"{s.get('overlap_with_response', 0):>6.2f} "
+        f"{s.get('staleness', 0):>6d} "
+        f"{s.get('avg_latency_ms', 0):>8.0f} "
+        f"{s.get('samples', 0):>5d}"
+    )
+
+bottom = min(3, len(rows))
+if bottom:
+    print()
+    print(f"Deactivation candidates (lowest composite = chg-amt + ovlp):")
+    for c, name, _ in rows[:bottom]:
+        print(f"  - {name}  composite={c:.2f}")
+PY
+)
+    then
+        if [ -n "$rendered" ]; then
+            printf '%s\n' "$rendered"
+        fi
+    fi
+fi

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/comnik/autoprobe/internal/provider"
@@ -61,6 +62,7 @@ func NewAgent(prov provider.Provider, root, goal string, debug bool) *Agent {
 		tools:            DefaultTools,
 		debug:            debug,
 		contextBudget:    defaultContextBudgetTokens,
+		prevOutputs:      map[string][]byte{},
 	}
 }
 
@@ -89,6 +91,16 @@ type Agent struct {
 	lastOutputHash programHash
 	idleBackoff    time.Duration
 	overflowStreak int
+
+	// prevOutputs is a session-local buffer of each program's last-
+	// iteration output, used to compute change frequency, change amount,
+	// and staleness on the next iteration. Per-program statistics
+	// themselves live on disk at .autoprobe/statistics/<name>.json — they
+	// aren't cached on the Agent because parallel updaters read/write
+	// their own files independently and a shared cache would only force
+	// a serial merge.
+	prevMu      sync.Mutex
+	prevOutputs map[string][]byte
 }
 
 func (a *Agent) Conversation() []provider.Message { return a.conversation }
@@ -179,6 +191,8 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 			msg.StopReason = provider.StopToolUse
 		}
 	}
+	a.updateStats(data.results, joinAssistantText(msg.Content))
+
 	a.iteration++
 	a.lastOutputHash = data.hash
 	a.lastStopReason = msg.StopReason
@@ -202,6 +216,81 @@ func (a *Agent) toolSchemas() []provider.ToolDefinition {
 		}
 	}
 	return out
+}
+
+// updateStats folds this iteration's per-program observations into the
+// EWMA-based statistics and persists each program's record to
+// .autoprobe/statistics/<name>.json. Called once per substantive
+// iteration, right after the assistant message comes back so the overlap
+// metric can compare program output against what the model actually
+// said. Persistence failures are silent — stats are best-effort
+// telemetry, not load-bearing for correctness.
+//
+// Workers run in parallel under a separate errgroup (capped at
+// maxProgramConcurrency) because each program's record is its own file
+// and there is no shared map to coordinate. The assistant's trigram set
+// is computed once and shared read-only across workers; recomputing it
+// per program would be pure waste. prevOutputs accesses go through
+// prevMu since they're the only shared mutable state.
+//
+// Metrics that need a prior observation (ChangeFrequency, AvgChangeAmount,
+// Staleness) are only updated when prevOutputs has the program's last
+// output. On the first iteration after a restart those metrics retain
+// their on-disk values and only resume ticking on the second iteration
+// when a prev output is available.
+func (a *Agent) updateStats(results []programResult, assistantText string) {
+	respTri := wordTrigramSet(assistantText)
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxProgramConcurrency)
+	for _, r := range results {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r programResult) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			a.updateOneStat(r, respTri)
+		}(r)
+	}
+	wg.Wait()
+	_ = pruneStats(a.root, liveNamesFromResults(results))
+}
+
+// updateOneStat loads, updates, and saves one program's stats record.
+// Safe to call concurrently from multiple goroutines as long as each
+// goroutine owns a distinct program name: the per-program files are
+// independent on disk, and prevOutputs accesses are serialized by prevMu.
+func (a *Agent) updateOneStat(r programResult, respTri map[[3]string]struct{}) {
+	s := loadStatsFor(a.root, r.name)
+	if s == nil {
+		s = &programStats{}
+	}
+	n := s.Samples
+	s.AvgOutputTokens = ewma(s.AvgOutputTokens, float64(r.renderedTokens()), n, statsEWMAAlpha)
+	s.AvgLatencyMs = ewma(s.AvgLatencyMs, float64(r.latency.Milliseconds()), n, statsEWMAAlpha)
+	s.OverlapWithResp = ewma(s.OverlapWithResp, overlapRecall(string(r.output), respTri), n, statsEWMAAlpha)
+
+	a.prevMu.Lock()
+	prev, hasPrev := a.prevOutputs[r.name]
+	a.prevOutputs[r.name] = r.output
+	a.prevMu.Unlock()
+
+	if hasPrev {
+		changed := !bytes.Equal(prev, r.output)
+		obs := 0.0
+		if changed {
+			obs = 1.0
+		}
+		s.ChangeFrequency = ewma(s.ChangeFrequency, obs, n, statsEWMAAlpha)
+		s.AvgChangeAmount = ewma(s.AvgChangeAmount, changeAmount(prev, r.output), n, statsEWMAAlpha)
+		if changed {
+			s.Staleness = 0
+		} else {
+			s.Staleness++
+		}
+	}
+	s.Samples++
+	_ = saveStatsFor(a.root, r.name, s)
 }
 
 // advanceOverflowStreak updates the consecutive-overflow counter and reports
@@ -352,11 +441,14 @@ type programHash [sha256.Size]byte
 
 // programResult captures everything one program contributed to this
 // iteration: its name, its exit code (a status channel separate from stdout
-// per the program contract), and the captured combined stdout+stderr bytes.
+// per the program contract), the captured combined stdout+stderr bytes,
+// and the wall-clock time the run took. Latency feeds the per-program
+// latency EWMA in stats.
 type programResult struct {
 	name     string
 	exitCode int
 	output   []byte
+	latency  time.Duration
 }
 
 func (r programResult) header() string {
@@ -458,9 +550,9 @@ func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, erro
 
 // iterationData bundles one iteration's worth of program execution: the
 // per-program results sorted by name, the pre-selection hash over (name,
-// exit, stdout) triples, the inactive-set membership, and the summed token
-// estimate. Carried into assembleUserMessage and into the idle/overflow
-// bookkeeping in Step.
+// exit, stdout) triples, the inactive-set membership, and the summed
+// token estimate. Carried into assembleUserMessage and into the idle/
+// overflow bookkeeping in Step.
 type iterationData struct {
 	results     []programResult
 	hash        programHash
@@ -633,7 +725,9 @@ func (a *Agent) runPrograms(ctx context.Context) ([]programResult, error) {
 	for i, name := range names {
 		g.Go(func() error {
 			path := filepath.Join(a.programsDir, name)
+			start := time.Now()
 			out, runErr := exec.CommandContext(gctx, path).CombinedOutput()
+			elapsed := time.Since(start)
 
 			var exitErr *exec.ExitError
 			if runErr != nil && !errors.As(runErr, &exitErr) {
@@ -643,7 +737,7 @@ func (a *Agent) runPrograms(ctx context.Context) ([]programResult, error) {
 			if exitErr != nil {
 				exitCode = exitErr.ExitCode()
 			}
-			results[i] = programResult{name: name, exitCode: exitCode, output: out}
+			results[i] = programResult{name: name, exitCode: exitCode, output: out, latency: elapsed}
 			return nil
 		})
 	}
