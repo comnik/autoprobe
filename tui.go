@@ -314,7 +314,7 @@ func (m *tuiModel) refreshOuter() {
 	yOffset := m.outerVp.YOffset
 	content, _ := m.buildOuterContent(entries, pinnedIdx)
 	m.outerVp.SetContent(content)
-	m.outerVp.YOffset = yOffset
+	m.outerVp.SetYOffset(yOffset)
 }
 
 // scrollOuterToActive scrolls the outer viewport so that the active block's
@@ -333,14 +333,7 @@ func (m *tuiModel) scrollOuterToActive() {
 	if activeLine < 0 {
 		return
 	}
-	maxY := m.outerVp.TotalLineCount() - m.outerVp.Height
-	if activeLine > maxY {
-		activeLine = maxY
-	}
-	if activeLine < 0 {
-		activeLine = 0
-	}
-	m.outerVp.YOffset = activeLine
+	m.outerVp.SetYOffset(activeLine)
 }
 
 // buildOuterContent renders the scrollable region (everything except pinned)
