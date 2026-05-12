@@ -77,6 +77,43 @@ func TestHashResultsFlipsWhenExitCodeChanges(t *testing.T) {
 	}
 }
 
+func TestRunProgramsFlagsNonExecutableFile(t *testing.T) {
+	t.Parallel()
+	// A file dropped into the programs dir without execute bits would
+	// otherwise make exec error out and abort the iteration. The guardrail
+	// should turn that into a non-zero-exit result so the message lands in
+	// the agent's context and can be corrected.
+	a := newAgentWithPrograms(t, programSpec{"good", "#!/bin/sh\necho ok\n"})
+	bad := filepath.Join(a.programsDir, "bad")
+	if err := os.WriteFile(bad, []byte("#!/bin/sh\necho should-not-run\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := a.runPrograms(context.Background())
+	if err != nil {
+		t.Fatalf("runPrograms must not error on a non-executable file: %v", err)
+	}
+	var got *programResult
+	for i := range results {
+		if results[i].name == "bad" {
+			got = &results[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("expected a result row for the non-executable file")
+	}
+	if got.exitCode == 0 {
+		t.Errorf("non-executable file must surface with non-zero exit (force-includes it); got 0")
+	}
+	if !strings.Contains(string(got.output), "not executable") {
+		t.Errorf("output should explain the problem; got %q", got.output)
+	}
+	if !strings.Contains(string(got.output), "bad") {
+		t.Errorf("output should name the offending program; got %q", got.output)
+	}
+}
+
 func TestNoOverflowIncludesEveryProgram(t *testing.T) {
 	t.Parallel()
 	a := newAgentWithPrograms(t,

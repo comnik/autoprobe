@@ -41,5 +41,7 @@ programs that model your environment and and compress what you learn about how t
 the user's goal. Prefer executable programs over static files, so that you can encode your
 assumptions.
 
+All programs you write need to be made executable.
+
 The solution program should also be written to the `$AUTOPROBE_PROGRAMS_DIR` directory.
 EOF

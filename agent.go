@@ -725,6 +725,22 @@ func (a *Agent) runPrograms(ctx context.Context) ([]programResult, error) {
 	for i, name := range names {
 		g.Go(func() error {
 			path := filepath.Join(a.programsDir, name)
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				return fmt.Errorf("stat %s: %w", name, statErr)
+			}
+			// A program file with no execute bit set would surface as an opaque
+			// "permission denied" exec error that aborts the iteration. Convert
+			// it into a non-zero-exit result so the message reaches the model's
+			// context (force-included by the alarm channel) and can be fixed.
+			if info.Mode()&0o111 == 0 {
+				results[i] = programResult{
+					name:     name,
+					exitCode: 126,
+					output:   []byte(fmt.Sprintf("[program %s is not executable]\n", name)),
+				}
+				return nil
+			}
 			start := time.Now()
 			out, runErr := exec.CommandContext(gctx, path).CombinedOutput()
 			elapsed := time.Since(start)
