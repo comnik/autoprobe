@@ -47,8 +47,7 @@ EOF
 # python merge them in-memory for ranking; a missing/empty directory just
 # suppresses this section. Programs are sorted ascending by a composite
 # of change-information-content + overlap-with-response so the least
-# valuable rows surface at the top of the table and at the bottom-k
-# callout — those are the agent's first candidates for $INACTIVE.
+# valuable rows surface at the top of the table.
 if [ -d "$STATS_DIR" ]; then
     if rendered=$(python3 - "$STATS_DIR" 2>/dev/null <<'PY'
 import json, os, sys
@@ -94,13 +93,6 @@ for _, name, s in rows:
         f"{s.get('avg_latency_ms', 0):>8.0f} "
         f"{s.get('samples', 0):>5d}"
     )
-
-bottom = min(3, len(rows))
-if bottom:
-    print()
-    print(f"Deactivation candidates (lowest composite = chg-amt + ovlp):")
-    for c, name, _ in rows[:bottom]:
-        print(f"  - {name}  composite={c:.2f}")
 PY
 )
     then
