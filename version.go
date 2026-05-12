@@ -1,4 +1,4 @@
 package main
 
 // Version is the current autoprobe release. Bumped manually on release.
-const Version = "0.2.0"
+const Version = "0.3.0"
