@@ -2,7 +2,17 @@
 
 ## Implementation status
 
-Not yet implemented. This document describes the design before code lands.
+Phase 1 has landed in v0.3.0: `autoprobe run` clears
+`.autoprobe-last-run/` on start, writes the `run` header to
+`log.jsonl`, and emits one `iter-NNNNN.json` per substantive iteration
+plus a matching `iteration` summary line. The on-disk file `Tracer`
+lives in `trace.go`; the capture point is at the tail of `Step` in
+`agent.go` as designed. Phases 2–4 (the `autoprobe trace` server and
+viewer, the programs/stats panels, polish) are not yet implemented.
+
+The `autoprobe init` flow does not yet add `.autoprobe-last-run/` to a
+project's `.gitignore`; for now operators in environments where
+program output may contain secrets must add the entry themselves.
 
 ## Problem
 
@@ -312,20 +322,22 @@ the repo's, if present) so the default state is safe.
 
 Suggested attack order so a partial landing is still useful:
 
-1. **File tracer + per-iteration JSON.** Clear and recreate
-   `.autoprobe-last-run/` at the start of `autoprobe run`. Write the
-   `run` header to `log.jsonl`, then for each iteration write
-   `iter-NNNNN.json` and append an `iteration` line to the log. No
-   viewer yet — JSONL is already inspectable with `jq` and `tail -f`
-   and is enough to validate the capture is complete and the format
-   round-trips every field that matters.
+1. **File tracer + per-iteration JSON.** *(Done in v0.3.0.)* Clear and
+   recreate `.autoprobe-last-run/` at the start of `autoprobe run`.
+   Write the `run` header to `log.jsonl`, then for each iteration
+   write `iter-NNNNN.json` and append an `iteration` line to the log.
+   No viewer yet — JSONL is already inspectable with `jq` and
+   `tail -f` and is enough to validate the capture is complete and
+   the format round-trips every field that matters.
 2. **`autoprobe trace` server + minimal viewer.** Static HTML that
    lists iterations and renders the conversation for one at a time.
    No programs table, no stats panel yet — just enough UI to step
    through a run.
 3. **Programs table + stats panel.** Sort, filter, expand outputs.
 4. **Polish.** Keyboard nav, deep-link URLs, collapsible thinking
-   blocks, budget visualisation, interrupted-trace handling.
+   blocks, budget visualisation, interrupted-trace handling. Also
+   the `autoprobe init` `.gitignore` write described in "Trace
+   artifacts are sensitive".
 
 Phase 1 is the load-bearing one — once iteration files exist on disk,
 the rest is presentation that can be evolved without touching the
