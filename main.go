@@ -176,13 +176,18 @@ func cmdRun(args []string) error {
 	cmd := flag.NewFlagSet("run", flag.ExitOnError)
 	debug := cmd.Bool("debug", false, "wait for user input between iterations")
 	goal := cmd.String("goal", "", "inline goal statement appended to the conversation as the last program output")
+	maxIter := cmd.Int("n", 0, "exit after this many iterations (idle polls count); 0 means unlimited")
 	cmd.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: autoprobe run [--debug] [--goal <text>] [path]")
+		fmt.Fprintln(os.Stderr, "usage: autoprobe run [--debug] [--goal <text>] [-n <count>] [path]")
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "  --debug        wait for user input between iterations")
 		fmt.Fprintln(os.Stderr, "  --goal <text>  inline goal statement appended to the conversation as the last program output")
+		fmt.Fprintln(os.Stderr, "  -n <count>     exit after this many iterations (idle polls count); 0 means unlimited")
 	}
 	cmd.Parse(args)
+	if *maxIter < 0 {
+		return fmt.Errorf("-n must be non-negative")
+	}
 
 	path := defaultProbeDir
 	if cmd.NArg() > 0 {
@@ -207,7 +212,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	agent := NewAgent(provider, path, *goal, *debug)
+	agent := NewAgent(provider, path, *goal, *debug, *maxIter)
 	return agent.Run(context.TODO())
 }
 

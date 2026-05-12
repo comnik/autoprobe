@@ -66,7 +66,7 @@ func newTestAgent(t *testing.T, prov provider.Provider) *Agent {
 	if err := os.WriteFile(filepath.Join(progDir, "counter"), []byte(counterProgram), 0755); err != nil {
 		t.Fatal(err)
 	}
-	return NewAgent(prov, root, "", false)
+	return NewAgent(prov, root, "", false, 0)
 }
 
 func bashToolCall(id, cmd string) provider.ToolCall {

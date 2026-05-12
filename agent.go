@@ -49,7 +49,7 @@ const (
 	revisionReinforcementName = "revision"
 )
 
-func NewAgent(prov provider.Provider, root, goal string, debug bool) *Agent {
+func NewAgent(prov provider.Provider, root, goal string, debug bool, maxIterations int) *Agent {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
@@ -62,6 +62,7 @@ func NewAgent(prov provider.Provider, root, goal string, debug bool) *Agent {
 		tools:            DefaultTools,
 		debug:            debug,
 		contextBudget:    defaultContextBudgetTokens,
+		maxIterations:    maxIterations,
 		prevOutputs:      map[string][]byte{},
 	}
 }
@@ -75,9 +76,11 @@ type Agent struct {
 	tools            []ToolDefinition
 	debug            bool
 	contextBudget    int // token ceiling for the program-output slot
+	maxIterations    int // exit after this many runIteration calls; 0 = unlimited
 
-	conversation []provider.Message
-	iteration    int
+	conversation    []provider.Message
+	iteration       int
+	totalIterations int // counts every runIteration call, including idle polls
 
 	// Carried across Steps. lastStopReason controls whether the prior
 	// assistant/tool history is preserved (tool-using cycle) or thrown away
@@ -142,9 +145,13 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		if err != nil {
 			return provider.AssistantMessage{}, false, err
 		}
+		a.totalIterations++
 
 		midCycle := a.lastStopReason == provider.StopToolUse
 		if !midCycle && a.iteration > 0 && fresh.hash == a.lastOutputHash {
+			if a.reachedMaxIterations() {
+				return provider.AssistantMessage{}, true, nil
+			}
 			d := a.nextIdleBackoff()
 			select {
 			case <-time.After(d):
@@ -203,7 +210,13 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 			a.conversation = append(a.conversation, a.executeTool(call))
 		}
 	}
-	return msg, false, nil
+	return msg, a.reachedMaxIterations(), nil
+}
+
+// reachedMaxIterations reports whether the -n cap has been hit. Returns false
+// when no cap was configured (maxIterations == 0).
+func (a *Agent) reachedMaxIterations() bool {
+	return a.maxIterations > 0 && a.totalIterations >= a.maxIterations
 }
 
 func (a *Agent) toolSchemas() []provider.ToolDefinition {
