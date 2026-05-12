@@ -1,5 +1,26 @@
 # Context budget and active program selection
 
+## Implementation status
+
+- **2026-05-12** (`43a7e19`): Core mechanics landed. Context limit (default
+  128K tokens, configurable on the Agent), `.autoprobe/inactive` parsing,
+  inclusion algorithm with the 80/20 split and skipped-program sentinels,
+  exploration slot (non-zero-exit inactives lex-ordered then uniform-random
+  zero-exit draws), pre-selection `(name, exit, stdout)` hash for idle
+  backoff, and the revision prompt (edge-triggered on first overflow,
+  periodic every 10 sustained-overflow iterations) implemented as
+  executable scripts under `reinforcement/revision/` so paths resolve at
+  runtime rather than being baked into a Go string. The cornerstone-as-
+  always-active special case was removed from the design during
+  implementation; the `aaa-cornerstone` asset still ships the convention
+  text but is otherwise a normal program.
+- **Not yet implemented**: per-program statistics — both the cheap
+  always-on metrics (avg tokens, change frequency, line-level diff ratio,
+  latency, staleness, overlap-with-response) and the sampled causal-
+  influence ablation. The `.autoprobe/statistics` file does not exist yet,
+  and the revision prompt does not surface per-program metrics. Tracking
+  in [statistics follow-up](#per-program-statistics).
+
 ## Problem
 
 The library of installed programs grows monotonically. Programs are cheap to write,
