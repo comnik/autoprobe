@@ -9,7 +9,7 @@ files.
 **Objectives**
 
 1. 10x fewer in-context tokens without loss of quality or time taken to complete a task.
-2. Reusable abstractions that persist across sessions.
+2. Reusable abstractions that persist across sessions. No hard compaction.
 3. Fine-grained grounding and steering by human users.
 
 ## Motivation
