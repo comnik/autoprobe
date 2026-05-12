@@ -37,13 +37,18 @@ func LoadConfig(probeDir string) (Config, error) {
 	return cfg, nil
 }
 
-// WriteConfig serializes cfg to <probeDir>/config.yaml.
+// WriteConfig serializes cfg to <probeDir>/config.yaml, prefixed with a
+// comment recording the autoprobe release that wrote it. The version lives
+// in a comment (not a struct field) so it's purely informational — users
+// shouldn't think they can pin or override it.
 func WriteConfig(probeDir string, cfg Config) error {
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath(probeDir), data, 0644)
+	out := []byte(fmt.Sprintf("# written by autoprobe v%s\n", Version))
+	out = append(out, data...)
+	return os.WriteFile(configPath(probeDir), out, 0644)
 }
 
 // configExists reports whether config.yaml is present in probeDir.
