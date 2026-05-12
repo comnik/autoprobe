@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/comnik/autoprobe/internal/provider"
 )
@@ -213,6 +214,25 @@ func cmdRun(args []string) error {
 		return err
 	}
 	agent := NewAgent(provider, path, *goal, *debug, *maxIter)
+
+	tracer, err := NewTracer(traceDirName)
+	if err != nil {
+		return err
+	}
+	defer tracer.Close()
+	if err := tracer.WriteRunHeader(RunHeader{
+		AutoprobeVersion:    Version,
+		StartedAt:           time.Now(),
+		ProbeDir:            path,
+		Provider:            cfg.Provider,
+		Model:               provider.DefaultModel(),
+		Goal:                *goal,
+		ContextBudgetTokens: agent.ContextBudget(),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: trace header write failed: %v\n", err)
+	}
+	agent.SetTracer(tracer)
+
 	return agent.Run(context.TODO())
 }
 

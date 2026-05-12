@@ -77,6 +77,7 @@ type Agent struct {
 	debug            bool
 	contextBudget    int // token ceiling for the program-output slot
 	maxIterations    int // exit after this many runIteration calls; 0 = unlimited
+	tracer           *Tracer
 
 	conversation    []provider.Message
 	iteration       int
@@ -110,6 +111,13 @@ func (a *Agent) Conversation() []provider.Message { return a.conversation }
 func (a *Agent) Iteration() int                   { return a.iteration }
 func (a *Agent) StepThrough() bool                { return a.debug }
 func (a *Agent) Provider() provider.Provider      { return a.provider }
+func (a *Agent) ContextBudget() int               { return a.contextBudget }
+
+// SetTracer attaches a run tracer. Trace writes are best-effort; a nil
+// tracer disables tracing entirely. Setter rather than constructor arg so
+// the existing call sites (tests, current main.go) don't have to be
+// rewired for callers that never trace.
+func (a *Agent) SetTracer(t *Tracer) { a.tracer = t }
 
 func (a *Agent) Run(ctx context.Context) error {
 	return runTUI(ctx, a)
@@ -134,7 +142,13 @@ func (a *Agent) Prime(ctx context.Context) error {
 // exponential backoff rather than re-querying the model. The agent never
 // auto-terminates — done is always false on success.
 func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, error) {
-	var data iterationData
+	var (
+		data            iterationData
+		userMsg         provider.UserMessage
+		showPrompt      bool
+		idlePollsBefore int
+		idleWait        time.Duration
+	)
 	for {
 		var history []provider.Message
 		if a.lastStopReason == provider.StopToolUse && len(a.conversation) > 1 {
@@ -155,22 +169,30 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 			d := a.nextIdleBackoff()
 			select {
 			case <-time.After(d):
+				idlePollsBefore++
+				idleWait += d
 				continue
 			case <-ctx.Done():
 				return provider.AssistantMessage{}, false, ctx.Err()
 			}
 		}
 
-		showPrompt := a.advanceOverflowStreak(fresh.overflowed(a.contextBudget))
-		userMsg := a.assembleUserMessage(fresh, showPrompt)
+		showPrompt = a.advanceOverflowStreak(fresh.overflowed(a.contextBudget))
+		userMsg = a.assembleUserMessage(fresh, showPrompt)
 		a.conversation = append([]provider.Message{userMsg}, history...)
 		a.idleBackoff = 0
 		data = fresh
 		break
 	}
 
+	iterStartedAt := time.Now()
+	// Snapshot the slice header that gets sent to the provider so a later
+	// append (assistant message, tool results) doesn't bleed into the
+	// trace's captured context — len is fixed here even if the underlying
+	// array grows.
+	contextMsgs := a.conversation
 	c := provider.Context{
-		Messages: a.conversation,
+		Messages: contextMsgs,
 		Tools:    a.toolSchemas(),
 	}
 	msg, err := a.provider.Generate(ctx, "", c, provider.Options{MaxTokens: 8192})
@@ -205,12 +227,66 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 	a.lastStopReason = msg.StopReason
 	a.conversation = append(a.conversation, msg)
 
+	var toolResults []provider.ToolResultMessage
 	for _, c := range msg.Content {
 		if call, ok := c.(provider.ToolCall); ok {
-			a.conversation = append(a.conversation, a.executeTool(call))
+			tr := a.executeTool(call)
+			a.conversation = append(a.conversation, tr)
+			toolResults = append(toolResults, tr)
 		}
 	}
+
+	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt)
 	return msg, a.reachedMaxIterations(), nil
+}
+
+// writeTrace assembles this iteration's trace record and hands it to the
+// tracer. Best-effort: tracing is diagnostic, not load-bearing, so any
+// error is logged to stderr (visible after the TUI exits) and the run
+// continues. A nil tracer short-circuits.
+func (a *Agent) writeTrace(
+	started, completed time.Time,
+	idlePolls int,
+	idleWait time.Duration,
+	contextMsgs []provider.Message,
+	resp provider.AssistantMessage,
+	toolResults []provider.ToolResultMessage,
+	data iterationData,
+	userMsg provider.UserMessage,
+	revisionFired bool,
+) {
+	if a.tracer == nil {
+		return
+	}
+	activeBudget := a.contextBudget * activeBudgetPercent / 100
+	rec := IterationTrace{
+		Iteration:       a.iteration,
+		StartedAt:       started,
+		CompletedAt:     completed,
+		IdlePollsBefore: idlePolls,
+		IdleWaitMs:      idleWait.Milliseconds(),
+		Context:         TraceContext{Messages: serializeContextMessages(contextMsgs)},
+		Response: TraceResponse{
+			Model:      resp.Model,
+			StopReason: stopReasonString(resp.StopReason),
+			Usage:      TraceUsage{InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens},
+			Content:    serializeAssistantContent(resp.Content),
+		},
+		ToolResults: serializeToolResults(toolResults),
+		Programs:    buildTracePrograms(data.results, data.inactive, userMsg),
+		Budget: TraceBudget{
+			LimitTokens:             a.contextBudget,
+			UsedTokens:              data.totalTokens,
+			Overflowed:              data.overflowed(a.contextBudget),
+			RevisionPromptFired:     revisionFired,
+			ActiveBudgetTokens:      activeBudget,
+			ExplorationBudgetTokens: a.contextBudget - activeBudget,
+		},
+		StatsSnapshot: snapshotStats(a.root),
+	}
+	if err := a.tracer.WriteIteration(rec); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: trace write failed for iteration %d: %v\n", rec.Iteration, err)
+	}
 }
 
 // reachedMaxIterations reports whether the -n cap has been hit. Returns false
