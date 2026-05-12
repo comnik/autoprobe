@@ -39,14 +39,21 @@ func runReinforcement(t *testing.T, script, programsDir, cwd, argsJSON string) s
 }
 
 const (
-	libraryScript = "assets/reinforcement/write/library.sh"
-	generalScript = "assets/reinforcement/write/general.sh"
+	libraryScript  = "assets/reinforcement/write/library.sh"
+	generalScript  = "assets/reinforcement/write/general.sh"
+	revisionScript = "assets/reinforcement/revision/general.sh"
 
 	// Sentinel substrings unique to each reinforcement payload. If the
 	// canonical messages drift, these guards force the tests to be
 	// updated deliberately.
-	libraryMarker = "lexicographically"
-	generalMarker = "only persistent memory"
+	libraryMarker     = "lexicographically"
+	generalMarker     = "only persistent memory"
+	revisionMarker    = "[REVISION]"
+	revisionInactive  = "demotion list lives at"
+	revisionRewrite   = "Improve information density"
+	revisionExitCode  = "exit non-zero"
+	revisionTailSlot  = "20% exploration slot"
+	revisionWriteEdit = "write/edit tools"
 )
 
 func TestLibraryReinforcement_FiresForAbsolutePathInsideProgramsDir(t *testing.T) {
@@ -174,5 +181,121 @@ func TestGeneralReinforcement_SilentWhenPathMissing(t *testing.T) {
 	out := runReinforcement(t, generalScript, pd, "", `{"content":"x"}`)
 	if out != "" {
 		t.Fatalf("expected silence when path is missing, got: %q", out)
+	}
+}
+
+// installRevisionScript copies the shipped asset into a temp probe-dir
+// layout (probeDir/programs, probeDir/reinforcement/revision/general.sh) so
+// the script's $0-derived path computation lands on a realistic directory
+// structure rather than the assets tree. Returns the probe dir and the
+// installed script's absolute path.
+func installRevisionScript(t *testing.T) (probeDir, scriptPath string) {
+	t.Helper()
+	probeDir = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(probeDir, "programs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	revDir := filepath.Join(probeDir, "reinforcement", "revision")
+	if err := os.MkdirAll(revDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.ReadFile(revisionScript)
+	if err != nil {
+		t.Fatalf("reading asset %s: %v", revisionScript, err)
+	}
+	scriptPath = filepath.Join(revDir, "general.sh")
+	if err := os.WriteFile(scriptPath, src, 0755); err != nil {
+		t.Fatal(err)
+	}
+	return probeDir, scriptPath
+}
+
+// runScript executes the given absolute script path with no stdin and no
+// env overrides (other than inherited os.Environ). Failures are fatal —
+// the revision script is expected to succeed; silent failure would mask
+// the bug class these tests exist to catch.
+func runScript(t *testing.T, scriptPath, cwd string, env []string) string {
+	t.Helper()
+	cmd := exec.Command(scriptPath)
+	cmd.Env = env
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("%s failed: %v\nstderr: %s", filepath.Base(scriptPath), err, stderr.String())
+	}
+	return stdout.String()
+}
+
+// probeDirPathForms returns the candidate path strings under probeDir/sub
+// the script could plausibly emit: both the as-given form and the
+// EvalSymlinks-canonicalized form. On macOS, /var → /private/var is a
+// system symlink; depending on which form $0 was invoked with and whether
+// `cd ... && pwd` canonicalizes, either may appear. Asserting "contains
+// one of these forms" keeps the test portable.
+func probeDirPathForms(t *testing.T, probeDir, sub string) []string {
+	t.Helper()
+	forms := []string{filepath.Join(probeDir, sub)}
+	if resolved, err := filepath.EvalSymlinks(probeDir); err == nil && resolved != probeDir {
+		forms = append(forms, filepath.Join(resolved, sub))
+	}
+	return forms
+}
+
+func containsAny(s string, candidates []string) bool {
+	for _, c := range candidates {
+		if strings.Contains(s, c) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRevisionScript_EmitsPromptWithResolvedPaths(t *testing.T) {
+	t.Parallel()
+	probeDir, scriptPath := installRevisionScript(t)
+	out := runScript(t, scriptPath, "", os.Environ())
+
+	// All section anchors must appear so a future refactor that silently
+	// drops part of the prompt fails the test rather than the agent.
+	for _, want := range []string{revisionMarker, revisionInactive, revisionRewrite, revisionExitCode, revisionTailSlot, revisionWriteEdit} {
+		if !strings.Contains(out, want) {
+			t.Errorf("revision prompt missing marker %q in output", want)
+		}
+	}
+
+	if !containsAny(out, probeDirPathForms(t, probeDir, "programs")) {
+		t.Errorf("output missing resolved programs dir under %q:\n%s", probeDir, out)
+	}
+	if !containsAny(out, probeDirPathForms(t, probeDir, "inactive")) {
+		t.Errorf("output missing resolved inactive path under %q:\n%s", probeDir, out)
+	}
+
+	// Defensive: the literal "$AUTOPROBE_PROGRAMS_DIR" string must never
+	// reach the agent unresolved. If it does, the script either expanded
+	// the wrong variable or someone reverted to the Go-string version.
+	if strings.Contains(out, "$AUTOPROBE_PROGRAMS_DIR") {
+		t.Errorf("output contains unresolved $AUTOPROBE_PROGRAMS_DIR:\n%s", out)
+	}
+}
+
+func TestRevisionScript_IndependentOfEnvAndCwd(t *testing.T) {
+	t.Parallel()
+	probeDir, scriptPath := installRevisionScript(t)
+
+	// Set AUTOPROBE_PROGRAMS_DIR to a bogus value and run from an unrelated
+	// cwd. The script must ignore both and derive paths from $0.
+	env := []string{"AUTOPROBE_PROGRAMS_DIR=/should/not/appear/in/output", "PATH=" + os.Getenv("PATH")}
+	cwd := t.TempDir()
+	out := runScript(t, scriptPath, cwd, env)
+
+	if strings.Contains(out, "/should/not/appear") {
+		t.Errorf("script honored $AUTOPROBE_PROGRAMS_DIR instead of deriving from $0:\n%s", out)
+	}
+	if !containsAny(out, probeDirPathForms(t, probeDir, "programs")) {
+		t.Errorf("script did not resolve to the installed probe dir; cwd=%s probeDir=%s output:\n%s", cwd, probeDir, out)
 	}
 }

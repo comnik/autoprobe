@@ -60,11 +60,7 @@ The set of programs whose output is preferentially included in the context is
 defined by exclusion: programs are active **by default**, and the agent maintains
 `.autoprobe/inactive` as the list of programs it has explicitly demoted.
 
-A program is active iff:
-
-- It is the **cornerstone program** (always active, even if listed in
-  `.autoprobe/inactive`), or
-- It is not listed in `.autoprobe/inactive`.
+A program is active iff it is not listed in `.autoprobe/inactive`.
 
 Non-zero exit codes do not change active-set membership. Instead, they bias
 the 20% exploration slot's selection so that inactive programs with non-zero
@@ -99,11 +95,10 @@ After all programs have run, the harness builds the context for this iteration:
      name** — exit code does not reorder. The 80% slice is therefore byte-stable
      across iterations as long as the active programs' outputs don't change,
      which keeps the provider's prompt cache warm on the bulk of the context.
-     The cornerstone naturally sorts first via the existing `aaa-` naming
-     convention. Active programs that exit non-zero are already guaranteed
-     visibility by being in the active set; promoting them ahead of other
-     active programs would buy a duplicate guarantee at the cost of cache
-     stability whenever alarm sets change.
+     Active programs that exit non-zero are already guaranteed visibility by
+     being in the active set; promoting them ahead of other active programs
+     would buy a duplicate guarantee at the cost of cache stability whenever
+     alarm sets change.
    - **20% exploration budget**, filled in two phases:
      1. **Inactive programs that exited non-zero on this iteration**, in
         lexicographic order by program name. This is how the exit code contract
@@ -365,8 +360,8 @@ renewed value.
 
 - `.autoprobe/inactive` — newline-delimited list of program names the agent has
   explicitly demoted. Edited by the agent. The file is allowed to be missing or
-  empty; in that case, every program is active. The cornerstone is always active
-  even if listed here. Entries naming programs that no longer exist are ignored.
+  empty; in that case, every program is active. Entries naming programs that no
+  longer exist are ignored.
 - `.autoprobe/statistics` — per-program metrics, updated by the harness every
   iteration. Read-only from the agent's perspective; surfaced into the context on
   demand and as part of the revision prompt.
