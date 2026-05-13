@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>autoprobe trace · {{.Header.ProbeDir}}</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-index-href="index.html">
+  <div id="app">
+    <div class="header">
+      <h1>autoprobe trace</h1>
+      <div class="header-info">
+        <div class="info-item"><span class="info-label">started</span><span class="info-value">{{.Header.StartedAt | formatTime}}</span></div>
+        <div class="info-item"><span class="info-label">probe dir</span><span class="info-value">{{.Header.ProbeDir}}</span></div>
+        <div class="info-item"><span class="info-label">provider</span><span class="info-value">{{.Header.Provider}} / {{.Header.Model}}</span></div>
+        <div class="info-item"><span class="info-label">budget</span><span class="info-value">{{.Header.ContextBudgetTokens | formatThousands}} tokens</span></div>
+        <div class="info-item"><span class="info-label">autoprobe</span><span class="info-value">v{{.Header.AutoprobeVersion}}</span></div>
+        <div class="info-item"><span class="info-label">iterations</span><span class="info-value">{{len .Iterations}}</span></div>
+      </div>
+      {{if .Header.Goal}}<div class="goal">{{.Header.Goal}}</div>{{end}}
+    </div>
+
+    <div class="help-bar">
+      <span>{{len .Iterations}} iteration{{if ne (len .Iterations) 1}}s{{end}} captured</span>
+    </div>
+
+    {{if .Iterations}}
+    <table class="iter-list">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>start (Δ)</th>
+          <th class="num">dur</th>
+          <th class="num">in / out</th>
+          <th>stop</th>
+          <th>flags</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Iterations}}
+        <tr>
+          <td class="iter-link"><a href="{{.HTMLFile}}">{{.NPadded}}</a></td>
+          <td>{{.RelStart}}{{if .IdlePollsBefore}} <span class="badge demoted" title="idle polls before this iteration">+{{.IdlePollsBefore}} idle</span>{{end}}</td>
+          <td class="num">{{.DurationStr}}</td>
+          <td class="num">{{.InputTokens | formatThousands}} / {{.OutputTokens | formatThousands}}</td>
+          <td><span class="badge stop {{.StopClass}}">{{.StopReason}}</span></td>
+          <td>
+            {{if .Overflowed}}<span class="badge overflow" title="budget overflowed this iteration">overflow</span>{{end}}
+            {{if .RevisionPromptFired}}<span class="badge revision" title="revision prompt fired">revise</span>{{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div class="iter-list empty">no iterations recorded yet</div>
+    {{end}}
+
+    <div class="footer">
+      autoprobe v{{.Header.AutoprobeVersion}} · keyboard: <span class="kbd">g</span> jump to iteration
+    </div>
+  </div>
+  <script src="viewer.js"></script>
+</body>
+</html>

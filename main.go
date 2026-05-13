@@ -233,7 +233,11 @@ func cmdRun(args []string) error {
 	}
 	agent.SetTracer(tracer)
 
-	return agent.Run(context.TODO())
+	if err := agent.Run(context.TODO()); err != nil {
+		return err
+	}
+	fmt.Printf("trace: open %s/index.html\n", traceDirName)
+	return nil
 }
 
 func buildProvider(name, model string) (provider.Provider, error) {

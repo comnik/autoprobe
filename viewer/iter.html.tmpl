@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>iter {{.Iter.Iteration}} · autoprobe trace</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body
+  data-index-href="index.html"
+  {{if .PrevHref}}data-prev-href="{{.PrevHref}}"{{end}}
+  {{if .NextHref}}data-next-href="{{.NextHref}}"{{end}}>
+  <div id="app">
+    <div class="iter-nav">
+      {{if .PrevHref}}<a href="{{.PrevHref}}">← iter {{.PrevN}}</a>{{else}}<span class="disabled">← iter</span>{{end}}
+      <a href="index.html">↑ index</a>
+      {{if .NextHref}}<a href="{{.NextHref}}">iter {{.NextN}} →</a>{{else}}<span class="disabled">iter →</span>{{end}}
+      <span class="spacer"></span>
+      <span class="iter-title">iteration {{.Iter.Iteration}} / {{.TotalIterations}}</span>
+      <span class="kbd-hint"><span class="kbd">←</span><span class="kbd">→</span> nav · <span class="kbd">esc</span> index · <span class="kbd">g</span> goto</span>
+    </div>
+
+    <div class="iter-summary">
+      <div class="field"><span class="label">started</span><span class="value">{{.Iter.StartedAt | formatTime}}</span></div>
+      <div class="field"><span class="label">duration</span><span class="value">{{.DurationStr}}</span></div>
+      <div class="field"><span class="label">stop reason</span><span class="value">{{.Iter.Response.StopReason}}</span></div>
+      <div class="field"><span class="label">input tokens</span><span class="value">{{.Iter.Response.Usage.InputTokens | formatThousands}}</span></div>
+      <div class="field"><span class="label">output tokens</span><span class="value">{{.Iter.Response.Usage.OutputTokens | formatThousands}}</span></div>
+      <div class="field"><span class="label">model</span><span class="value">{{.Iter.Response.Model}}</span></div>
+      {{if .Iter.IdlePollsBefore}}<div class="field"><span class="label">idle polls before</span><span class="value">{{.Iter.IdlePollsBefore}} ({{.IdleWaitStr}})</span></div>{{end}}
+      <div class="field">
+        <span class="label">budget</span>
+        <span class="value">{{.Iter.Budget.UsedTokens | formatThousands}} / {{.Iter.Budget.LimitTokens | formatThousands}}</span>
+        <div class="budget-bar{{if .Iter.Budget.Overflowed}} over{{end}}"><div class="budget-used" style="width: {{.BudgetPercent}}%"></div></div>
+      </div>
+      <div class="badges-row">
+        {{if .Iter.Budget.Overflowed}}<span class="badge overflow">overflow</span>{{end}}
+        {{if .Iter.Budget.RevisionPromptFired}}<span class="badge revision">revision prompt fired</span>{{end}}
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>conversation</h2>
+      <div id="messages">
+        {{range .Messages}}
+        <div class="message {{.Role}}{{if .IsError}} error{{end}}"{{if .Anchor}} id="{{.Anchor}}"{{end}}>
+          <div class="message-role">
+            {{.RoleLabel}}
+            {{if .ToolName}}<span class="tool-meta">{{.ToolName}} · {{.ToolCallID}}{{if .IsError}} · error{{end}}</span>{{end}}
+          </div>
+          {{range .Blocks}}{{template "block" .}}{{end}}
+        </div>
+        {{end}}
+      </div>
+    </div>
+
+    {{if .Iter.Programs}}
+    <div class="section">
+      <h2>programs ({{len .Iter.Programs}})</h2>
+      <table class="programs sortable">
+        <thead>
+          <tr>
+            <th data-sort-key="name" data-sort-type="string">name</th>
+            <th class="num" data-sort-key="exit" data-sort-type="number">exit</th>
+            <th class="num" data-sort-key="latency" data-sort-type="number">latency</th>
+            <th data-sort-key="active" data-sort-type="bool">status</th>
+            <th data-sort-key="included" data-sort-type="bool">in context</th>
+            <th class="num" data-sort-key="tokens" data-sort-type="number">tokens</th>
+            <th>output</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Iter.Programs}}
+          <tr{{if not .Active}} class="demoted"{{end}}>
+            <td data-sort-value="{{.Name}}">{{.Name}}</td>
+            <td class="num" data-sort-value="{{.Exit}}">{{if eq .Exit 0}}<span class="badge stop-end">0</span>{{else}}<span class="badge exit-nonzero">{{.Exit}}</span>{{end}}</td>
+            <td class="num" data-sort-value="{{.LatencyMs}}">{{.LatencyMs}}ms</td>
+            <td data-sort-value="{{if .Active}}true{{else}}false{{end}}">
+              {{if .Active}}<span class="badge included">active</span>{{else}}<span class="badge demoted">demoted</span>{{end}}
+              {{if .ExplorationPhase}}<span class="badge phase">{{.ExplorationPhase}}</span>{{end}}
+            </td>
+            <td data-sort-value="{{if .Included}}true{{else}}false{{end}}">{{if .Included}}<span class="badge included">included</span>{{else}}<span class="badge demoted">skipped</span>{{end}}</td>
+            <td class="num" data-sort-value="{{.OutputTokens}}">{{.OutputTokens | formatThousands}}</td>
+            <td class="output">
+              {{if .Output}}
+              <details>
+                <summary>show ({{.Output | byteLen}} bytes)</summary>
+                <div class="output-body">{{.Output}}</div>
+              </details>
+              {{else}}<span class="badge demoted">empty</span>{{end}}
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{end}}
+
+    {{if .HasStats}}
+    <div class="section">
+      <h2>stats snapshot</h2>
+      <table class="stats sortable">
+        <thead>
+          <tr>
+            <th data-sort-key="name" data-sort-type="string">name</th>
+            <th class="num" data-sort-key="samples" data-sort-type="number">samples</th>
+            <th class="num" data-sort-key="avg_tokens" data-sort-type="number">avg tokens</th>
+            <th class="num" data-sort-key="latency" data-sort-type="number">avg lat (ms)</th>
+            <th class="num" data-sort-key="change_freq" data-sort-type="number">chg freq</th>
+            <th class="num" data-sort-key="change_amt" data-sort-type="number">chg amt</th>
+            <th class="num" data-sort-key="overlap" data-sort-type="number">overlap</th>
+            <th class="num" data-sort-key="staleness" data-sort-type="number">stale</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Stats}}
+          <tr>
+            <td data-sort-value="{{.Name}}">{{.Name}}</td>
+            <td class="num" data-sort-value="{{.Samples}}">{{.Samples}}</td>
+            <td class="num" data-sort-value="{{.AvgOutputTokens}}">{{.AvgOutputTokens | formatFloat}}</td>
+            <td class="num" data-sort-value="{{.AvgLatencyMs}}">{{.AvgLatencyMs | formatFloat}}</td>
+            <td class="num" data-sort-value="{{.ChangeFrequency}}">{{.ChangeFrequency | formatFloat}}</td>
+            <td class="num" data-sort-value="{{.AvgChangeAmount}}">{{.AvgChangeAmount | formatFloat}}</td>
+            <td class="num" data-sort-value="{{.OverlapWithResp}}">{{.OverlapWithResp | formatFloat}}</td>
+            <td class="num" data-sort-value="{{.Staleness}}">{{.Staleness}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{end}}
+
+    <div class="footer">
+      autoprobe v{{.Header.AutoprobeVersion}} · iteration {{.Iter.Iteration}} of {{.TotalIterations}}
+    </div>
+  </div>
+  <script src="viewer.js"></script>
+</body>
+</html>
+
+{{define "block"}}
+{{- if eq .Kind "text" -}}
+<div class="block text">{{.Text}}</div>
+{{- else if eq .Kind "thinking" -}}
+<details class="block thinking"><summary>thinking{{if .Signature}}<span class="signature">[sig: {{.SignaturePreview}}]</span>{{end}}</summary><div class="thinking-text">{{.Text}}</div></details>
+{{- else if eq .Kind "tool_call" -}}
+<div class="block tool-call">
+  <div class="tool-call-header"><a class="tool-link" href="#{{.ToolAnchor}}"><span class="tool-name">{{.ToolName}}</span></a><span class="tool-id">{{.ToolCallID}}</span></div>
+  <div class="tool-call-args">{{.Text}}</div>
+</div>
+{{- else if eq .Kind "program" -}}
+<div class="block program{{if .ProgramExitNonzero}} exit-nonzero{{end}}">
+  <div class="program-header">
+    <span class="program-name">{{.ProgramName}}</span>
+    <span class="program-tail">{{.ProgramTail}}</span>
+  </div>
+  <div class="program-body">{{.Text}}</div>
+</div>
+{{- else if eq .Kind "note" -}}
+<div class="block note">{{.Text}}</div>
+{{- else if eq .Kind "tool_result_body" -}}
+<div class="tool-result-body">{{.Text}}</div>
+{{- end -}}
+{{end}}

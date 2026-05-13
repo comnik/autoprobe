@@ -39,13 +39,23 @@ const (
 // traceDirName. Tracing is unconditional and best-effort: a failed write
 // surfaces as a warning to stderr and never aborts the run.
 //
-// The mutex guards the log file handle; in current usage the Tracer is
-// driven serially from Agent.Step but the lock keeps it safe if the call
-// site ever fans out.
+// Each WriteIteration produces one iter-NNNNN.html, re-renders the prior
+// iter's HTML so its "next" link points at the new file, and re-renders
+// index.html with the updated iteration list. log.jsonl is still written
+// as a machine-readable index of the run.
+//
+// The mutex guards the log file handle and the in-memory state used for
+// re-rendering (header / entries / prevRec). In current usage the Tracer
+// is driven serially from Agent.Step but the lock keeps it safe if the
+// call site ever fans out.
 type Tracer struct {
 	dir string
 	log *os.File
 	mu  sync.Mutex
+
+	header  RunHeader
+	entries []iterationLogEntry
+	prevRec *IterationTrace
 }
 
 // NewTracer clears and recreates dir, then opens log.jsonl for appending.
@@ -93,15 +103,27 @@ type RunHeader struct {
 	ContextBudgetTokens int       `json:"context_budget_tokens"`
 }
 
-// WriteRunHeader appends the run header line. Caller fills the data
-// fields; Kind and FormatVersion are stamped here so callers can't
-// accidentally drift from the on-disk format.
+// WriteRunHeader appends the run header line, copies the static viewer
+// assets into the trace dir, and writes an initial index.html. After this
+// call the operator can already open index.html in a browser — it just
+// shows "no iterations yet" until the first WriteIteration lands.
 func (t *Tracer) WriteRunHeader(h RunHeader) error {
 	if t == nil {
 		return nil
 	}
 	h.Kind = "run"
 	h.FormatVersion = traceFormatVersion
+
+	t.mu.Lock()
+	t.header = h
+	t.mu.Unlock()
+
+	if err := writeStaticAssets(t.dir); err != nil {
+		return fmt.Errorf("write viewer assets: %w", err)
+	}
+	if err := renderIndex(t.dir, h, nil); err != nil {
+		return fmt.Errorf("render initial index: %w", err)
+	}
 	return t.appendLogLine(h)
 }
 
@@ -122,9 +144,9 @@ type iterationLogEntry struct {
 	OutputTokens        int       `json:"output_tokens"`
 }
 
-// IterationTrace is the on-disk shape of iter-NNNNN.json — the exhaustive
-// per-iteration slice the viewer renders. Built by the agent at the tail
-// of Step and handed to WriteIteration.
+// IterationTrace is the in-memory shape passed to the renderer — the
+// exhaustive per-iteration slice the viewer turns into iter-NNNNN.html.
+// Built by the agent at the tail of Step and handed to WriteIteration.
 type IterationTrace struct {
 	FormatVersion   int                      `json:"format_version"`
 	Iteration       int                      `json:"iteration"`
@@ -216,28 +238,25 @@ type TraceBudget struct {
 	ExplorationBudgetTokens int  `json:"exploration_budget_tokens"`
 }
 
-// WriteIteration writes the per-iteration JSON file with tmp+rename so a
-// process killed mid-write never leaves a partially-written iter file,
-// then appends the matching summary line to log.jsonl. The order is
-// intentional: the log must never reference a file that isn't on disk
-// yet. Returns the first error encountered; on iter-file failure no log
-// line is appended.
+// WriteIteration renders the iteration's HTML page, re-renders the prior
+// iteration's page so its "next" link points at the new one, re-renders
+// index.html, and appends the matching summary line to log.jsonl. All
+// HTML writes go through tmp+rename so a process killed mid-write never
+// leaves a partial page. The log line is appended last so the index never
+// references a file that isn't on disk yet.
 func (t *Tracer) WriteIteration(rec IterationTrace) error {
 	if t == nil {
 		return nil
 	}
 	rec.FormatVersion = traceFormatVersion
 
-	file := iterationFileName(rec.Iteration)
-	path := filepath.Join(t.dir, file)
-	if err := writeJSONAtomic(path, &rec); err != nil {
-		return err
-	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	entry := iterationLogEntry{
 		Kind:                "iteration",
 		N:                   rec.Iteration,
-		File:                file,
+		File:                iterationHTMLName(rec.Iteration),
 		StartedAt:           rec.StartedAt,
 		DurationMs:          rec.CompletedAt.Sub(rec.StartedAt).Milliseconds(),
 		StopReason:          rec.Response.StopReason,
@@ -247,7 +266,46 @@ func (t *Tracer) WriteIteration(rec IterationTrace) error {
 		InputTokens:         rec.Response.Usage.InputTokens,
 		OutputTokens:        rec.Response.Usage.OutputTokens,
 	}
-	return t.appendLogLine(entry)
+	t.entries = append(t.entries, entry)
+	total := len(t.entries)
+
+	// Re-render the prior iter to insert a "next" link to this one. Its
+	// own "prev" link still points at whatever came before it (or zero if
+	// it was the first iteration).
+	if t.prevRec != nil {
+		prevPrevN := 0
+		if total >= 3 {
+			prevPrevN = t.entries[total-3].N
+		}
+		if err := renderIteration(t.dir, t.header, *t.prevRec, prevPrevN, rec.Iteration, total); err != nil {
+			return err
+		}
+	}
+
+	// Render this iter. "next" is unknown until the next iteration is
+	// written, so we leave NextN=0 here — the template renders a disabled
+	// placeholder.
+	prevN := 0
+	if t.prevRec != nil {
+		prevN = t.prevRec.Iteration
+	}
+	if err := renderIteration(t.dir, t.header, rec, prevN, 0, total); err != nil {
+		return err
+	}
+
+	if err := renderIndex(t.dir, t.header, t.entries); err != nil {
+		return err
+	}
+
+	if err := t.appendLogLineLocked(entry); err != nil {
+		return err
+	}
+
+	// Stash a copy so the *next* iteration can re-render this one with a
+	// "next" link populated.
+	rec2 := rec
+	t.prevRec = &rec2
+	return nil
 }
 
 // appendLogLine marshals v as compact JSON and writes a single
@@ -255,40 +313,24 @@ func (t *Tracer) WriteIteration(rec IterationTrace) error {
 // the append is atomic with respect to concurrent readers, so a viewer
 // or `tail -f` never sees a partial line.
 func (t *Tracer) appendLogLine(v any) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.appendLogLineLocked(v)
+}
+
+// appendLogLineLocked is the lock-held variant used by WriteIteration,
+// which already holds t.mu around the render-then-log sequence.
+func (t *Tracer) appendLogLineLocked(v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.log == nil {
 		return fmt.Errorf("trace log closed")
 	}
 	_, err = t.log.Write(data)
 	return err
-}
-
-func iterationFileName(n int) string {
-	return fmt.Sprintf("iter-%0*d.json", tracePadding, n)
-}
-
-// writeJSONAtomic writes v as indented JSON to path via a sibling tmp
-// file plus rename. The `.tmp` lives next to the target on the same
-// filesystem so rename is atomic; on failure the tmp is left behind for
-// inspection rather than silently cleaned up.
-func writeJSONAtomic(path string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 // stopReasonString maps provider.StopReason to its trace-format string.
