@@ -1,12 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
+	"time"
 )
+
+// DefaultBashTimeoutMillis bounds every bash tool call. Without it, a single
+// agent-issued command that doesn't return (ncurses programs, `tail -f`, a
+// stuck network call) would freeze the whole eval loop.
+const DefaultBashTimeoutMillis = 60_000
 
 type ToolDefinition struct {
 	Name        string
@@ -57,6 +66,15 @@ var BashTool = ToolDefinition{
 				"type":        "string",
 				"description": "Bash command to execute.",
 			},
+			"timeout": map[string]any{
+				"type": "integer",
+				"description": fmt.Sprintf(
+					"Optional timeout in milliseconds (must be > 0). Defaults to %d. "+
+						"On expiry the whole process group is killed.",
+					DefaultBashTimeoutMillis,
+				),
+				"minimum": 1,
+			},
 		},
 		"required": []string{"command"},
 	},
@@ -66,11 +84,40 @@ var BashTool = ToolDefinition{
 func runBash(input json.RawMessage) (string, error) {
 	var args struct {
 		Command string `json:"command"`
+		Timeout int    `json:"timeout,omitempty"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return "", err
 	}
-	out, err := exec.Command("bash", "-c", args.Command).CombinedOutput()
+	timeoutMs := args.Timeout
+	if timeoutMs <= 0 {
+		timeoutMs = DefaultBashTimeoutMillis
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "-c", args.Command)
+	// Put bash and its descendants in a fresh process group so we can kill the
+	// whole tree on timeout. Otherwise SIGKILL hits bash but leaves ncurses
+	// children (e.g. cmatrix) running, draining the eval host.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		// Negative pid = signal the whole process group.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// Backstop: if Cancel returns but some descendant is still holding stdio
+	// pipes open, Wait would otherwise hang indefinitely. Give it a grace
+	// window then force-return whatever output we collected.
+	cmd.WaitDelay = 5 * time.Second
+
+	out, err := cmd.CombinedOutput()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return string(out), fmt.Errorf("timed out after %dms (process group killed)", timeoutMs)
+	}
 	if err != nil {
 		return string(out), fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
 	}
