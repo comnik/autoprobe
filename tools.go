@@ -19,6 +19,13 @@ import (
 // stuck network call) would freeze the whole eval loop.
 const DefaultBashTimeoutMillis = 60_000
 
+// DefaultBashMaxOutputBytes caps the in-memory output buffered for a single
+// bash call. Past this, runBash spills the full output to a temp file and
+// returns only the tail (with a marker pointing at the file). 64KB is small
+// enough that a runaway `cat huge.log` or `find /` doesn't blow the agent's
+// context window, and large enough to cover typical command output.
+const DefaultBashMaxOutputBytes = 64 * 1024
+
 type ToolDefinition struct {
 	Name        string
 	Description string
@@ -179,20 +186,12 @@ func runBashWith(ops BashOperations, input json.RawMessage) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 
-	var (
-		buf bytes.Buffer
-		mu  sync.Mutex
-	)
-	onData := func(data []byte) {
-		mu.Lock()
-		buf.Write(data)
-		mu.Unlock()
-	}
+	acc := newOutputAccumulator(DefaultBashMaxOutputBytes)
+	defer acc.Close()
+	onData := func(data []byte) { acc.Append(data) }
 
 	exitCode, err := ops.Exec(ctx, args.Command, onData)
-	mu.Lock()
-	out := buf.String()
-	mu.Unlock()
+	out := acc.Render()
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return out, fmt.Errorf("timed out after %dms (process group killed)", timeoutMs)
@@ -204,6 +203,102 @@ func runBashWith(ops BashOperations, input json.RawMessage) (string, error) {
 		return out, fmt.Errorf("%s: %w", strings.TrimSpace(out), &ExitError{Code: exitCode})
 	}
 	return out, nil
+}
+
+// outputAccumulator buffers bash output with two safety nets:
+//   - rolling window keeps at most ~2*maxBytes in memory
+//   - once total received exceeds maxBytes, full output also spills to a
+//     temp file so the agent can still get at it via a marker in the result
+//
+// Render returns the tail of the buffered output (aligned to a line
+// boundary), with a truncation marker appended when applicable.
+type outputAccumulator struct {
+	mu sync.Mutex
+
+	maxBytes int
+
+	chunks        [][]byte
+	bufferedBytes int
+	totalBytes    int
+
+	tempFile *os.File
+	tempPath string
+}
+
+func newOutputAccumulator(maxBytes int) *outputAccumulator {
+	return &outputAccumulator{maxBytes: maxBytes}
+}
+
+func (a *outputAccumulator) Append(data []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.totalBytes += len(data)
+
+	// Once we cross the threshold, spill everything to a temp file. The
+	// rolling window can only show the tail; the spill preserves the head
+	// for anyone willing to read the file.
+	if a.totalBytes > a.maxBytes && a.tempFile == nil {
+		if f, err := os.CreateTemp("", "autoprobe-bash-*.log"); err == nil {
+			a.tempFile = f
+			a.tempPath = f.Name()
+			for _, c := range a.chunks {
+				_, _ = f.Write(c)
+			}
+		}
+	}
+	if a.tempFile != nil {
+		_, _ = a.tempFile.Write(data)
+	}
+
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	a.chunks = append(a.chunks, cp)
+	a.bufferedBytes += len(cp)
+	for a.bufferedBytes > 2*a.maxBytes && len(a.chunks) > 1 {
+		a.bufferedBytes -= len(a.chunks[0])
+		a.chunks = a.chunks[1:]
+	}
+}
+
+func (a *outputAccumulator) Close() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.tempFile != nil {
+		_ = a.tempFile.Close()
+		a.tempFile = nil
+	}
+}
+
+func (a *outputAccumulator) Render() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	full := bytes.Join(a.chunks, nil)
+	if a.totalBytes <= a.maxBytes {
+		return string(full)
+	}
+
+	tail := full
+	if len(tail) > a.maxBytes {
+		tail = tail[len(tail)-a.maxBytes:]
+	}
+	// Align to a line boundary so the first visible line isn't a fragment.
+	if i := bytes.IndexByte(tail, '\n'); i != -1 && i < len(tail)-1 {
+		tail = tail[i+1:]
+	}
+
+	marker := fmt.Sprintf(
+		"\n\n[Output truncated: showing last %dB of %dB. Full output: %s]",
+		len(tail), a.totalBytes, a.tempPath,
+	)
+	if a.tempPath == "" {
+		marker = fmt.Sprintf(
+			"\n\n[Output truncated: showing last %dB of %dB. (Failed to spill full output to temp file.)]",
+			len(tail), a.totalBytes,
+		)
+	}
+	return string(tail) + marker
 }
 
 var EditTool = ToolDefinition{

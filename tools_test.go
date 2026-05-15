@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -264,20 +265,88 @@ func TestRunBash_PluggableBackend_TimeoutPropagatesViaContext(t *testing.T) {
 	}
 }
 
-// TestRunBash_OutputTruncationAndSpill: cap returned output at a
-// line/byte budget; write the full output to a temp file and surface
-// its path. Today CombinedOutput returns everything in memory, which
-// is fine for `ls` but ruinous for `cat huge.log`.
 func TestRunBash_OutputTruncationAndSpill(t *testing.T) {
-	t.Skip("TODO: tail-truncate with full-output spill (cf. pi-mono OutputAccumulator + truncateTail)")
+	// ~100KB total, well over the 64KB default threshold. Each chunk is a
+	// numbered line so we can identify the tail unambiguously.
+	const nLines = 1000
+	var emitted strings.Builder
+	for i := 0; i < nLines; i++ {
+		fmt.Fprintf(&emitted, "line %04d %s\n", i, strings.Repeat("x", 95))
+	}
+	fake := &fakeBashOps{
+		exec: func(_ context.Context, _ string, onData func([]byte)) (int, error) {
+			// Emit in modest chunks so the rolling-window/spill paths both exercise.
+			data := []byte(emitted.String())
+			for i := 0; i < len(data); i += 4096 {
+				end := i + 4096
+				if end > len(data) {
+					end = len(data)
+				}
+				onData(data[i:end])
+			}
+			return 0, nil
+		},
+	}
+	raw, _ := json.Marshal(map[string]any{"command": "x", "timeout": 5000})
+	out, err := runBashWith(fake, raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(out) >= emitted.Len() {
+		t.Fatalf("expected truncated output, got %d bytes (emitted %d)", len(out), emitted.Len())
+	}
+	if !strings.Contains(out, "Output truncated") {
+		t.Fatalf("expected truncation marker, got tail %q", out[max(0, len(out)-200):])
+	}
+	// Tail should include the last emitted lines; head should not.
+	if !strings.Contains(out, "line 0999") {
+		t.Fatalf("expected last line in tail, got %q", out[max(0, len(out)-300):])
+	}
+	if strings.Contains(out, "line 0000\n") {
+		t.Fatalf("did not expect first line in truncated tail")
+	}
+
+	// Parse the temp path out of the marker and confirm the full bytes spilled.
+	re := regexp.MustCompile(`Full output: (\S+)\]`)
+	m := re.FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("expected 'Full output: <path>' in marker, got tail %q", out[max(0, len(out)-200):])
+	}
+	tempPath := m[1]
+	t.Cleanup(func() { _ = os.Remove(tempPath) })
+
+	data, err := os.ReadFile(tempPath)
+	if err != nil {
+		t.Fatalf("reading spill file %s: %v", tempPath, err)
+	}
+	if len(data) != emitted.Len() {
+		t.Fatalf("spill file size %d != emitted %d", len(data), emitted.Len())
+	}
+	if string(data) != emitted.String() {
+		t.Fatalf("spill file content differs from emitted bytes")
+	}
 }
 
-// TestRunBash_AbortViaContext: caller-driven cancellation, distinct from
-// the configured timeout. Should return promptly with a cancellation
-// error and the partial output collected so far. Today the only cancel
-// path is the timeout context inside runBash.
-func TestRunBash_AbortViaContext(t *testing.T) {
-	t.Skip("TODO: accept a caller context (or AbortSignal-equivalent) so the TUI/agent can cancel a long-running command without waiting for the timeout")
+func TestRunBash_OutputNotTruncatedBelowThreshold(t *testing.T) {
+	payload := "small output\n"
+	fake := &fakeBashOps{
+		exec: func(_ context.Context, _ string, onData func([]byte)) (int, error) {
+			onData([]byte(payload))
+			return 0, nil
+		},
+	}
+	raw, _ := json.Marshal(map[string]any{"command": "x", "timeout": 5000})
+	out, err := runBashWith(fake, raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != payload {
+		t.Fatalf("expected output passed through verbatim, got %q", out)
+	}
+	if strings.Contains(out, "truncated") {
+		t.Fatalf("did not expect truncation marker for sub-threshold output")
+	}
 }
 
 // TestRunBash_TighterStdioHangHandling: when a detached descendant
