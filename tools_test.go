@@ -125,14 +125,11 @@ func TestRunBash_TimeoutKillsProcessGroup(t *testing.T) {
 	t.Fatalf("child pid %d still alive after timeout; process group kill did not reach it", childPid)
 }
 
-// TestRunBash_WaitDelayUnblocksOnDetachedStdio pins the current backstop.
-//
-// When a backgrounded grandchild inherits the shell's stdio pipe and holds
-// it open past the shell's own exit, runBash unblocks within WaitDelay
-// (~5s) rather than waiting for the grandchild's full lifetime. Today this
-// surfaces as an error ("exec: WaitDelay expired before I/O complete"),
-// not a clean success — even though the shell exited 0.
-func TestRunBash_WaitDelayUnblocksOnDetachedStdio(t *testing.T) {
+// TestRunBash_DetachedStdioReturnsPromptly: when a backgrounded grandchild
+// inherits the shell's stdio pipe and holds it open past the shell's own
+// exit, runBash returns within the stdio grace window (~100ms) and treats
+// the shell's exit code as authoritative — no spurious WaitDelay error.
+func TestRunBash_DetachedStdioReturnsPromptly(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("stdio inheritance semantics are Unix-specific")
 	}
@@ -158,16 +155,12 @@ func TestRunBash_WaitDelayUnblocksOnDetachedStdio(t *testing.T) {
 		}
 	})
 
-	if err == nil {
-		t.Fatalf("expected WaitDelay error, got nil")
+	if err != nil {
+		t.Fatalf("expected clean return despite detached grandchild holding stdio, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "WaitDelay") {
-		t.Fatalf("expected error to mention WaitDelay, got %v", err)
-	}
-	// WaitDelay is 5s; allow slack. The hard contract: we never wait for
-	// the grandchild's full 30s sleep.
-	if elapsed > 10*time.Second {
-		t.Fatalf("stdio backstop did not fire; runBash blocked for %v", elapsed)
+	// Generous CI slack; pi-mono uses 100ms grace, so 1s is comfortable.
+	if elapsed > time.Second {
+		t.Fatalf("stdio grace window too slow: returned after %v", elapsed)
 	}
 }
 
@@ -349,10 +342,3 @@ func TestRunBash_OutputNotTruncatedBelowThreshold(t *testing.T) {
 	}
 }
 
-// TestRunBash_TighterStdioHangHandling: when a detached descendant
-// holds the stdio pipes open, return shortly after the shell itself
-// exits — pi-mono uses EXIT_STDIO_GRACE_MS = 100, not the 5s WaitDelay
-// window we currently fall back on.
-func TestRunBash_TighterStdioHangHandling(t *testing.T) {
-	t.Skip("TODO: replace WaitDelay backstop with proactive stdio-end + destroy (cf. pi-mono waitForChildProcess); should return within ~100ms of shell exit instead of ~5s")
-}

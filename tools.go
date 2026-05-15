@@ -128,9 +128,11 @@ func (localBashOps) Exec(ctx context.Context, command string, onData func([]byte
 		}
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	// Backstop: if Cancel returns but some descendant is still holding stdio
-	// pipes open, Wait would otherwise hang indefinitely.
-	cmd.WaitDelay = 5 * time.Second
+	// Short grace period for stdout/stderr to drain after the shell exits.
+	// A detached grandchild that inherits the pipes (e.g. `cmd & disown`)
+	// would otherwise hold them open until it dies — we don't want to wait
+	// for that. The exit code from ProcessState is authoritative.
+	cmd.WaitDelay = 100 * time.Millisecond
 
 	w := &onDataWriter{fn: onData}
 	cmd.Stdout = w
@@ -138,6 +140,9 @@ func (localBashOps) Exec(ctx context.Context, command string, onData func([]byte
 
 	err := cmd.Run()
 	if err != nil {
+		if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil {
+			return cmd.ProcessState.ExitCode(), nil
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode(), nil
