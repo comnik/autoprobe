@@ -239,6 +239,43 @@ func TestRunBash_PluggableBackend_SpawnErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestRunBash_DefaultTimeoutAppliedWhenOmitted(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload map[string]any
+	}{
+		{"omitted", map[string]any{"command": "x"}},
+		{"zero", map[string]any{"command": "x", "timeout": 0}},
+		{"negative", map[string]any{"command": "x", "timeout": -1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var deadline time.Time
+			var hadDeadline bool
+			fake := &fakeBashOps{
+				exec: func(ctx context.Context, _ string, _ func([]byte)) (int, error) {
+					deadline, hadDeadline = ctx.Deadline()
+					return 0, nil
+				},
+			}
+			raw, _ := json.Marshal(tc.payload)
+			start := time.Now()
+			if _, err := runBashWith(fake, raw); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !hadDeadline {
+				t.Fatalf("expected ctx to carry a deadline, got none")
+			}
+			budget := deadline.Sub(start)
+			expected := time.Duration(DefaultBashTimeoutMillis) * time.Millisecond
+			// Generous slack: fake runs synchronously so the delta is just clock drift.
+			if budget < expected-time.Second || budget > expected+time.Second {
+				t.Fatalf("expected ~%v budget from default timeout, got %v", expected, budget)
+			}
+		})
+	}
+}
+
 func TestRunBash_PluggableBackend_TimeoutPropagatesViaContext(t *testing.T) {
 	fake := &fakeBashOps{
 		exec: func(ctx context.Context, _ string, _ func([]byte)) (int, error) {
