@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -81,7 +83,87 @@ var BashTool = ToolDefinition{
 	Function: runBash,
 }
 
+// BashOperations executes a bash command. Carving this out of runBash lets
+// tests inject a deterministic fake and lets future backends (SSH, sandbox,
+// container exec) plug in without touching the tool wrapper. Mirrors the
+// shape of pi-mono's BashOperations.
+type BashOperations interface {
+	// Exec runs command, streaming output through onData as it arrives.
+	// exitCode is meaningful only when err == nil. err covers spawn/IO
+	// failures and context cancellation (timeout or caller-driven).
+	Exec(ctx context.Context, command string, onData func([]byte)) (exitCode int, err error)
+}
+
+// ExitError is returned by runBash when the command ran to completion with
+// a non-zero exit. Distinct from spawn errors, timeouts, or cancellation.
+type ExitError struct {
+	Code int
+}
+
+func (e *ExitError) Error() string { return fmt.Sprintf("exit status %d", e.Code) }
+func (e *ExitError) ExitCode() int { return e.Code }
+
+// defaultBashOps is the production executor. Tests inject their own via
+// runBashWith.
+var defaultBashOps BashOperations = localBashOps{}
+
+type localBashOps struct{}
+
+func (localBashOps) Exec(ctx context.Context, command string, onData func([]byte)) (int, error) {
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	// Put bash and its descendants in a fresh process group so we can kill the
+	// whole tree on timeout. Otherwise SIGKILL hits bash but leaves ncurses
+	// children (e.g. cmatrix) running, draining the eval host.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// Backstop: if Cancel returns but some descendant is still holding stdio
+	// pipes open, Wait would otherwise hang indefinitely.
+	cmd.WaitDelay = 5 * time.Second
+
+	w := &onDataWriter{fn: onData}
+	cmd.Stdout = w
+	cmd.Stderr = w
+
+	err := cmd.Run()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode(), nil
+		}
+		return -1, err
+	}
+	return 0, nil
+}
+
+// onDataWriter adapts an exec.Cmd Stdout/Stderr writer to the BashOperations
+// onData callback. exec.Cmd spawns separate goroutines for stdout and stderr
+// when the writers differ, but uses a single writer when Stdout == Stderr;
+// even so, we serialize for safety since onData may be wired to a shared
+// buffer.
+type onDataWriter struct {
+	fn func([]byte)
+	mu sync.Mutex
+}
+
+func (w *onDataWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fn != nil {
+		w.fn(p)
+	}
+	return len(p), nil
+}
+
 func runBash(input json.RawMessage) (string, error) {
+	return runBashWith(defaultBashOps, input)
+}
+
+func runBashWith(ops BashOperations, input json.RawMessage) (string, error) {
 	var args struct {
 		Command string `json:"command"`
 		Timeout int    `json:"timeout,omitempty"`
@@ -97,31 +179,31 @@ func runBash(input json.RawMessage) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", args.Command)
-	// Put bash and its descendants in a fresh process group so we can kill the
-	// whole tree on timeout. Otherwise SIGKILL hits bash but leaves ncurses
-	// children (e.g. cmatrix) running, draining the eval host.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		// Negative pid = signal the whole process group.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	var (
+		buf bytes.Buffer
+		mu  sync.Mutex
+	)
+	onData := func(data []byte) {
+		mu.Lock()
+		buf.Write(data)
+		mu.Unlock()
 	}
-	// Backstop: if Cancel returns but some descendant is still holding stdio
-	// pipes open, Wait would otherwise hang indefinitely. Give it a grace
-	// window then force-return whatever output we collected.
-	cmd.WaitDelay = 5 * time.Second
 
-	out, err := cmd.CombinedOutput()
+	exitCode, err := ops.Exec(ctx, args.Command, onData)
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return string(out), fmt.Errorf("timed out after %dms (process group killed)", timeoutMs)
+		return out, fmt.Errorf("timed out after %dms (process group killed)", timeoutMs)
 	}
 	if err != nil {
-		return string(out), fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
+		return out, fmt.Errorf("%s: %w", strings.TrimSpace(out), err)
 	}
-	return string(out), nil
+	if exitCode != 0 {
+		return out, fmt.Errorf("%s: %w", strings.TrimSpace(out), &ExitError{Code: exitCode})
+	}
+	return out, nil
 }
 
 var EditTool = ToolDefinition{

@@ -1,11 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -50,12 +50,12 @@ func TestRunBash_NonzeroExitReturnsErrorWithOutput(t *testing.T) {
 	if !strings.Contains(out, "before") {
 		t.Fatalf("expected returned output to include stdout written before exit, got %q", out)
 	}
-	var exitErr *exec.ExitError
+	var exitErr *ExitError
 	if !errors.As(err, &exitErr) {
-		t.Fatalf("expected wrapped *exec.ExitError, got %T: %v", err, err)
+		t.Fatalf("expected wrapped *ExitError, got %T: %v", err, err)
 	}
-	if code := exitErr.ExitCode(); code != 7 {
-		t.Fatalf("expected exit code 7, got %d", code)
+	if exitErr.Code != 7 {
+		t.Fatalf("expected exit code 7, got %d", exitErr.Code)
 	}
 }
 
@@ -175,12 +175,93 @@ func TestRunBash_WaitDelayUnblocksOnDetachedStdio(t *testing.T) {
 // pi-mono shape. Each documents the contract we want next.
 // ============================================================================
 
-// TestRunBash_PluggableBackend: factor out a BashOperations-style interface
-// so callers (and tests) can inject a non-shell executor. Mirrors pi-mono's
-// createLocalBashOperations / BashOperations contract — enables future
-// SSH/container backends and deterministic unit tests without spawning bash.
-func TestRunBash_PluggableBackend(t *testing.T) {
-	t.Skip("TODO: introduce BashOperations interface + constructor; until then, runBash hardcodes exec.CommandContext(\"bash\", ...) with no injection point")
+// fakeBashOps lets tests stand in for the real executor.
+type fakeBashOps struct {
+	exec func(ctx context.Context, command string, onData func([]byte)) (int, error)
+}
+
+func (f *fakeBashOps) Exec(ctx context.Context, command string, onData func([]byte)) (int, error) {
+	return f.exec(ctx, command, onData)
+}
+
+func TestRunBash_PluggableBackend_StreamsAndExitsCleanly(t *testing.T) {
+	var capturedCommand string
+	fake := &fakeBashOps{
+		exec: func(_ context.Context, command string, onData func([]byte)) (int, error) {
+			capturedCommand = command
+			onData([]byte("hello "))
+			onData([]byte("world"))
+			return 0, nil
+		},
+	}
+	raw, _ := json.Marshal(map[string]any{"command": "echo hi", "timeout": 5000})
+	out, err := runBashWith(fake, raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedCommand != "echo hi" {
+		t.Fatalf("expected command 'echo hi', got %q", capturedCommand)
+	}
+	if out != "hello world" {
+		t.Fatalf("expected accumulated output 'hello world', got %q", out)
+	}
+}
+
+func TestRunBash_PluggableBackend_NonZeroExitYieldsExitError(t *testing.T) {
+	fake := &fakeBashOps{
+		exec: func(_ context.Context, _ string, onData func([]byte)) (int, error) {
+			onData([]byte("partial output"))
+			return 7, nil
+		},
+	}
+	raw, _ := json.Marshal(map[string]any{"command": "x", "timeout": 5000})
+	out, err := runBashWith(fake, raw)
+	if err == nil {
+		t.Fatalf("expected error for non-zero exit, got nil")
+	}
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected *ExitError, got %T: %v", err, err)
+	}
+	if exitErr.Code != 7 {
+		t.Fatalf("expected exit code 7, got %d", exitErr.Code)
+	}
+	if !strings.Contains(out, "partial output") {
+		t.Fatalf("expected partial output in result, got %q", out)
+	}
+}
+
+func TestRunBash_PluggableBackend_SpawnErrorPropagates(t *testing.T) {
+	sentinel := errors.New("spawn boom")
+	fake := &fakeBashOps{
+		exec: func(_ context.Context, _ string, _ func([]byte)) (int, error) {
+			return -1, sentinel
+		},
+	}
+	raw, _ := json.Marshal(map[string]any{"command": "x", "timeout": 5000})
+	_, err := runBashWith(fake, raw)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel error to propagate, got %v", err)
+	}
+}
+
+func TestRunBash_PluggableBackend_TimeoutPropagatesViaContext(t *testing.T) {
+	fake := &fakeBashOps{
+		exec: func(ctx context.Context, _ string, _ func([]byte)) (int, error) {
+			<-ctx.Done()
+			return -1, ctx.Err()
+		},
+	}
+	raw, _ := json.Marshal(map[string]any{"command": "sleep", "timeout": 100})
+	start := time.Now()
+	_, err := runBashWith(fake, raw)
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timed-out error, got %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("timeout fired too late: %v", elapsed)
+	}
 }
 
 // TestRunBash_OutputTruncationAndSpill: cap returned output at a
