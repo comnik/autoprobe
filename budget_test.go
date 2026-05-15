@@ -61,7 +61,7 @@ func renderUserMessage(t *testing.T, a *Agent) string {
 	if err != nil {
 		t.Fatalf("runIteration: %v", err)
 	}
-	return provider.JoinText(a.assembleUserMessage(data, false).Content)
+	return provider.JoinText(a.assembleUserMessage(data, false, false, false).Content)
 }
 
 func TestHashResultsFlipsWhenExitCodeChanges(t *testing.T) {
@@ -329,7 +329,7 @@ func TestRunRevisionPromptReturnsEmptyWhenDirMissing(t *testing.T) {
 	t.Parallel()
 	a := newAgentWithPrograms(t, programSpec{"only", "#!/bin/sh\necho hi\n"})
 	// reinforcement/revision/ is intentionally not created.
-	if got := a.runRevisionPrompt(); got != "" {
+	if got := a.runReinforcementPrompt(revisionReinforcementName); got != "" {
 		t.Fatalf("expected empty string when reinforcement/revision/ is missing, got %q", got)
 	}
 }
@@ -340,7 +340,7 @@ func TestRunRevisionPromptConcatenatesScriptsInLexOrder(t *testing.T) {
 	writeRevisionScript(t, a, "b-second.sh", "#!/bin/sh\necho TWO\n")
 	writeRevisionScript(t, a, "a-first.sh", "#!/bin/sh\necho ONE\n")
 
-	out := a.runRevisionPrompt()
+	out := a.runReinforcementPrompt(revisionReinforcementName)
 	idxOne := strings.Index(out, "ONE")
 	idxTwo := strings.Index(out, "TWO")
 	if idxOne < 0 || idxTwo < 0 {
@@ -365,7 +365,7 @@ func TestRunRevisionPromptSilentlySkipsFailingScripts(t *testing.T) {
 	writeRevisionScript(t, a, "a-broken.sh", "#!/bin/sh\necho boom; exit 1\n")
 	writeRevisionScript(t, a, "b-ok.sh", "#!/bin/sh\necho SURVIVED\n")
 
-	out := a.runRevisionPrompt()
+	out := a.runReinforcementPrompt(revisionReinforcementName)
 	if !strings.Contains(out, "SURVIVED") {
 		t.Errorf("a failing earlier script must not suppress later scripts: %q", out)
 	}
@@ -390,7 +390,7 @@ func TestAssembleUserMessageAppendsRevisionPromptAtTail(t *testing.T) {
 		t.Fatalf("test setup did not produce overflow")
 	}
 
-	msg := a.assembleUserMessage(data, true)
+	msg := a.assembleUserMessage(data, true, false, false)
 	if len(msg.Content) == 0 {
 		t.Fatal("assembled message is empty")
 	}
@@ -417,7 +417,7 @@ func TestAssembleUserMessageOmitsRevisionPromptWhenScriptMissing(t *testing.T) {
 		t.Fatalf("runIteration: %v", err)
 	}
 
-	msg := a.assembleUserMessage(data, true)
+	msg := a.assembleUserMessage(data, true, false, false)
 	for _, c := range msg.Content {
 		if strings.Contains(c.Text, "[REVISION]") {
 			t.Fatalf("revision prompt was emitted despite missing script: %q", c.Text)
@@ -470,7 +470,7 @@ func renderData(a *Agent, results []programResult, inactive map[string]struct{},
 	for _, r := range results {
 		d.totalTokens += r.renderedTokens()
 	}
-	return provider.JoinText(a.assembleUserMessage(d, showPrompt).Content)
+	return provider.JoinText(a.assembleUserMessage(d, showPrompt, false, false).Content)
 }
 
 func TestAssembleUserMessageFitsKeepsLexOrder(t *testing.T) {
@@ -517,7 +517,7 @@ func TestActiveSlotPackedInLexOrderDropsLateNames(t *testing.T) {
 	if !d.overflowed(a.contextBudget) {
 		t.Fatalf("setup did not overflow (total=%d budget=%d)", d.totalTokens, a.contextBudget)
 	}
-	text := provider.JoinText(a.assembleUserMessage(d, false).Content)
+	text := provider.JoinText(a.assembleUserMessage(d, false, false, false).Content)
 	aaaHdr := strings.Index(text, "[program=aaa exit=0]")
 	mmmHdr := strings.Index(text, "[program=mmm exit=0]")
 	zzzDrop := strings.Index(text, "[program=zzz dropped:")
@@ -557,7 +557,7 @@ func TestActiveAlarmKeepsLexPositionUnderOverflow(t *testing.T) {
 	if !d.overflowed(a.contextBudget) {
 		t.Fatalf("setup did not overflow (total=%d budget=%d)", d.totalTokens, a.contextBudget)
 	}
-	text := provider.JoinText(a.assembleUserMessage(d, false).Content)
+	text := provider.JoinText(a.assembleUserMessage(d, false, false, false).Content)
 	aaa := strings.Index(text, "[program=aaa exit=0]")
 	mmm := strings.Index(text, "[program=mmm exit=7]")
 	zzz := strings.Index(text, "[program=zzz exit=0]")

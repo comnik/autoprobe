@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/comnik/autoprobe/internal/provider"
@@ -47,6 +48,24 @@ const (
 	// but invoked from the context-assembly path rather than a tool call so
 	// stdin is empty.
 	revisionReinforcementName = "revision"
+
+	// Pseudo-tool name under reinforcement/ whose scripts emit the
+	// distillation prompt — a nudge for the agent to compress what it has
+	// learned during a tool-use cycle into a program. Fires periodically
+	// based on cycleInputTokenDebt and is forced on the wrap-up turn when -n
+	// is exhausted (with $AUTOPROBE_FINAL=1 set so the script can emit
+	// last-chance framing).
+	distillReinforcementName = "distill"
+
+	// Within a tool-use cycle, history accumulates and is re-billed on every
+	// subsequent inference. We track the cumulative non-program input tokens
+	// (InputTokens − the program-output portion of the user message) as a
+	// proxy for "page-iterations dragged." When the running total crosses
+	// this threshold the next user message carries a distill prompt and the
+	// counter is decremented by the threshold so firings stay periodic.
+	// 32K ≈ 16 pages × 1 iteration ≈ 4 pages × 4 iterations of drag, picked
+	// to fire on cycles long enough that compression should pay off.
+	distillThresholdTokens = 32 * 1024
 )
 
 func NewAgent(prov provider.Provider, root, goal string, debug bool, maxIterations int) *Agent {
@@ -96,6 +115,26 @@ type Agent struct {
 	idleBackoff    time.Duration
 	overflowStreak int
 
+	// finalPhase flips true on the first substantive Step that hits the -n cap
+	// and stays true for the remainder of the run. While set, Step skips idle
+	// backoff and forces a distill firing on the next user message (with
+	// $AUTOPROBE_FINAL=1 so the prompt can carry last-chance framing). The
+	// run terminates once the model returns a non-tool-use stop reason on
+	// (or after) entering this phase.
+	finalPhase bool
+
+	// Cumulative non-program input tokens billed since the current tool-use
+	// cycle began. Reset to zero whenever a Step returns !StopToolUse (the
+	// cycle's history is about to be wiped, so there is nothing to compress).
+	// When this exceeds distillThresholdTokens the next user message carries
+	// the distill prompt and the counter is decremented by the threshold.
+	cycleInputTokenDebt int
+	// distillPending is the latch between "debt crossed threshold this Step"
+	// and "next user message carries the distill prompt." A single bool is
+	// enough because we decrement debt by the threshold on firing, so a
+	// second-firing-in-one-Step can't happen.
+	distillPending bool
+
 	// prevOutputs is a session-local buffer of each program's last-
 	// iteration output, used to compute change frequency, change amount,
 	// and staleness on the next iteration. Per-program statistics
@@ -105,6 +144,25 @@ type Agent struct {
 	// a serial merge.
 	prevMu      sync.Mutex
 	prevOutputs map[string][]byte
+
+	// Live idle-polling visibility for the TUI. Step sits in its own
+	// goroutine relative to the TUI, so the header reads these atomically
+	// to render a "idle: N polls, Ms" indicator while the hash-match
+	// backoff loop is silently re-running programs and sleeping.
+	// idleStartedAtNs == 0 means "not currently idling".
+	idlePollsInFlight atomic.Int32
+	idleStartedAtNs   atomic.Int64
+}
+
+// IdleStatus reports whether Step is currently sitting in its idle-poll
+// backoff loop and, if so, how many polls have fired and how long the wait
+// has lasted. Used by the TUI header.
+func (a *Agent) IdleStatus() (polls int, since time.Duration, active bool) {
+	n := a.idleStartedAtNs.Load()
+	if n == 0 {
+		return 0, 0, false
+	}
+	return int(a.idlePollsInFlight.Load()), time.Since(time.Unix(0, n)), true
 }
 
 func (a *Agent) Conversation() []provider.Message { return a.conversation }
@@ -146,6 +204,7 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		data            iterationData
 		userMsg         provider.UserMessage
 		showPrompt      bool
+		showDistill     bool
 		idlePollsBefore int
 		idleWait        time.Duration
 	)
@@ -164,23 +223,43 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		midCycle := a.lastStopReason == provider.StopToolUse
 		if !midCycle && a.iteration > 0 && fresh.hash == a.lastOutputHash {
 			if a.reachedMaxIterations() {
-				return provider.AssistantMessage{}, true, nil
-			}
-			d := a.nextIdleBackoff()
-			select {
-			case <-time.After(d):
-				idlePollsBefore++
-				idleWait += d
-				continue
-			case <-ctx.Done():
-				return provider.AssistantMessage{}, false, ctx.Err()
+				// Hitting the cap while idle: the (skipped) idle turn stands
+				// in for the final normal turn — shortcut into the wrap-up
+				// phase rather than terminate without giving the agent a
+				// chance to persist what it learned.
+				a.finalPhase = true
+			} else {
+				d := a.nextIdleBackoff()
+				if a.idleStartedAtNs.Load() == 0 {
+					a.idleStartedAtNs.Store(time.Now().UnixNano())
+				}
+				a.idlePollsInFlight.Add(1)
+				select {
+				case <-time.After(d):
+					idlePollsBefore++
+					idleWait += d
+					continue
+				case <-ctx.Done():
+					a.idlePollsInFlight.Store(0)
+					a.idleStartedAtNs.Store(0)
+					return provider.AssistantMessage{}, false, ctx.Err()
+				}
 			}
 		}
 
 		showPrompt = a.advanceOverflowStreak(fresh.overflowed(a.contextBudget))
-		userMsg = a.assembleUserMessage(fresh, showPrompt)
+		// The wrap-up turn forces a distill firing; periodic firings are
+		// armed at the end of the prior Step via cycleInputTokenDebt.
+		if a.finalPhase {
+			a.distillPending = true
+		}
+		showDistill = a.distillPending
+		a.distillPending = false
+		userMsg = a.assembleUserMessage(fresh, showPrompt, showDistill, a.finalPhase)
 		a.conversation = append([]provider.Message{userMsg}, history...)
 		a.idleBackoff = 0
+		a.idlePollsInFlight.Store(0)
+		a.idleStartedAtNs.Store(0)
 		data = fresh
 		break
 	}
@@ -236,8 +315,41 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		}
 	}
 
-	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt)
-	return msg, a.reachedMaxIterations(), nil
+	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt, showDistill)
+
+	// Buffer-manager accounting for periodic distillation. Inside a tool-use
+	// cycle the history is re-billed every inference, so InputTokens minus
+	// the program-output portion of the user message approximates the
+	// page-iterations dragged this Step. We accumulate that and, when it
+	// crosses distillThresholdTokens, arm a distill firing for the next
+	// user message. The cycle ending (msg.StopReason != StopToolUse) clears
+	// the debt because the history is about to be wiped — there is nothing
+	// left to compress next turn.
+	if msg.StopReason == provider.StopToolUse {
+		drag := msg.Usage.InputTokens - data.totalTokens
+		if drag > 0 {
+			a.cycleInputTokenDebt += drag
+		}
+		if a.cycleInputTokenDebt >= distillThresholdTokens {
+			a.distillPending = true
+			a.cycleInputTokenDebt -= distillThresholdTokens
+		}
+	} else {
+		a.cycleInputTokenDebt = 0
+	}
+
+	// Terminate once the wrap-up turn (and any tool cycle it kicked off) has
+	// fully resolved. The wrap-up turn itself runs on the Step *after* we
+	// hit -n: this turn ends the cycle and arms finalPhase, the next Step
+	// sees finalPhase=true and forces a distill firing, and the Step after
+	// that returns done=true once the model stops calling tools.
+	done := false
+	if a.finalPhase {
+		done = msg.StopReason != provider.StopToolUse
+	} else if a.reachedMaxIterations() && msg.StopReason != provider.StopToolUse {
+		a.finalPhase = true
+	}
+	return msg, done, nil
 }
 
 // writeTrace assembles this iteration's trace record and hands it to the
@@ -254,6 +366,7 @@ func (a *Agent) writeTrace(
 	data iterationData,
 	userMsg provider.UserMessage,
 	revisionFired bool,
+	distillFired bool,
 ) {
 	if a.tracer == nil {
 		return
@@ -279,6 +392,7 @@ func (a *Agent) writeTrace(
 			UsedTokens:              data.totalTokens,
 			Overflowed:              data.overflowed(a.contextBudget),
 			RevisionPromptFired:     revisionFired,
+			DistillPromptFired:      distillFired,
 			ActiveBudgetTokens:      activeBudget,
 			ExplorationBudgetTokens: a.contextBudget - activeBudget,
 		},
@@ -594,15 +708,17 @@ func humanTokens(n int) string {
 	}
 }
 
-// runRevisionPrompt executes every script in reinforcement/revision/ in lex
-// order and joins their non-empty stdout with blank lines. Scripts derive
-// their own paths from $0 (see the shipped general.sh) so the rendered
-// prompt always carries fully-resolved paths regardless of where the probe
-// directory lives — the harness deliberately passes no env vars and no
-// stdin. A missing or empty reinforcement/revision/ dir yields "" and the
-// revision prompt is simply omitted from the iteration's context.
-func (a *Agent) runRevisionPrompt() string {
-	dir := filepath.Join(a.reinforcementDir, revisionReinforcementName)
+// runReinforcementPrompt executes every script in reinforcement/<name>/ in
+// lex order and joins their non-empty stdout with blank lines. Scripts
+// derive their own paths from $0 (see the shipped general.sh) so the
+// rendered prompt always carries fully-resolved paths regardless of where
+// the probe directory lives. extraEnv is appended to the script's
+// environment ("KEY=VALUE" entries) and lets the harness signal context to
+// the script — e.g. $AUTOPROBE_FINAL=1 on the wrap-up firing. A missing or
+// empty directory yields "" and the prompt is simply omitted from the
+// iteration's context.
+func (a *Agent) runReinforcementPrompt(name string, extraEnv ...string) string {
+	dir := filepath.Join(a.reinforcementDir, name)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return ""
@@ -618,7 +734,11 @@ func (a *Agent) runRevisionPrompt() string {
 
 	var parts []string
 	for _, name := range names {
-		out, runErr := exec.Command(filepath.Join(dir, name)).Output()
+		cmd := exec.Command(filepath.Join(dir, name))
+		if len(extraEnv) > 0 {
+			cmd.Env = append(os.Environ(), extraEnv...)
+		}
+		out, runErr := cmd.Output()
 		if runErr != nil {
 			continue
 		}
@@ -634,7 +754,7 @@ func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, erro
 	if err != nil {
 		return nil, err
 	}
-	return []provider.Message{a.assembleUserMessage(data, false)}, nil
+	return []provider.Message{a.assembleUserMessage(data, false, false, false)}, nil
 }
 
 // iterationData bundles one iteration's worth of program execution: the
@@ -686,7 +806,7 @@ func (a *Agent) runIteration(ctx context.Context) (iterationData, error) {
 // programs) and the exploration slot (non-zero-exit inactives lex-ordered
 // first, then a uniform random draw from zero-exit inactives). The goal
 // and revision prompt land at the tail of the context.
-func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt bool) provider.UserMessage {
+func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt, showDistillPrompt, finalPhase bool) provider.UserMessage {
 	var contents []provider.TextContent
 
 	if !d.overflowed(a.contextBudget) {
@@ -707,7 +827,16 @@ func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt bool) pr
 		contents = append(contents, provider.TextContent{Text: "[YOUR GOAL]\n" + a.goal})
 	}
 	if showRevisionPrompt {
-		if text := a.runRevisionPrompt(); text != "" {
+		if text := a.runReinforcementPrompt(revisionReinforcementName); text != "" {
+			contents = append(contents, provider.TextContent{Text: text})
+		}
+	}
+	if showDistillPrompt {
+		var env []string
+		if finalPhase {
+			env = []string{"AUTOPROBE_FINAL=1"}
+		}
+		if text := a.runReinforcementPrompt(distillReinforcementName, env...); text != "" {
 			contents = append(contents, provider.TextContent{Text: text})
 		}
 	}

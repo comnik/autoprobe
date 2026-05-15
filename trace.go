@@ -234,6 +234,7 @@ type TraceBudget struct {
 	UsedTokens              int  `json:"used_tokens"`
 	Overflowed              bool `json:"overflowed"`
 	RevisionPromptFired     bool `json:"revision_prompt_fired"`
+	DistillPromptFired      bool `json:"distill_prompt_fired"`
 	ActiveBudgetTokens      int  `json:"active_budget_tokens"`
 	ExplorationBudgetTokens int  `json:"exploration_budget_tokens"`
 }

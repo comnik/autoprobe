@@ -343,3 +343,198 @@ func TestStepMixedCycleResetsOnlyAfterStopEnd(t *testing.T) {
 		t.Fatalf("call 3 messages: got %d, want 1 (history reset after StopEnd)", got)
 	}
 }
+
+// writeDistillScript drops a distill reinforcement script into the agent's
+// reinforcement/distill/ directory. Mirror of writeRevisionScript from
+// budget_test.go (kept local rather than exporting that helper).
+func writeDistillScript(t *testing.T, a *Agent, name, body string) {
+	t.Helper()
+	dir := filepath.Join(a.reinforcementDir, distillReinforcementName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStepGivesAgentWrapupChanceAfterMaxIterations(t *testing.T) {
+	t.Parallel()
+	// -n is 1, so iteration 1 hits the cap. We expect a final wrap-up turn
+	// where the user message carries the wrap-up prompt, then termination.
+	prov := &scriptedProvider{
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "iter1"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "saved"}}, StopReason: provider.StopEnd},
+		},
+	}
+	a := newTestAgent(t, prov)
+	a.maxIterations = 1
+	// The wrap-up turn forces a distill firing with $AUTOPROBE_FINAL=1 set,
+	// so the test script branches on it to emit a marker only on the wrap-up
+	// firing. That way we also check that the final-phase env signal lands.
+	writeDistillScript(t, a, "general.sh",
+		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo WRAPUP-MARKER; fi\n")
+
+	ctx := context.Background()
+	_, done, err := a.Step(ctx)
+	if err != nil {
+		t.Fatalf("Step 1: %v", err)
+	}
+	if done {
+		t.Fatalf("Step 1 returned done=true; expected the wrap-up turn to still run")
+	}
+
+	_, done, err = a.Step(ctx)
+	if err != nil {
+		t.Fatalf("Step 2: %v", err)
+	}
+	if !done {
+		t.Fatalf("Step 2 returned done=false; expected termination after wrap-up turn")
+	}
+
+	if got := len(prov.calls); got != 2 {
+		t.Fatalf("provider call count: got %d, want 2", got)
+	}
+	// The wrap-up prompt must reach the model on the final turn.
+	u, ok := prov.calls[1].Messages[0].(provider.UserMessage)
+	if !ok {
+		t.Fatalf("call 2 message 1: got %T, want UserMessage", prov.calls[1].Messages[0])
+	}
+	if got := provider.JoinText(u.Content); !strings.Contains(got, "WRAPUP-MARKER") {
+		t.Fatalf("call 2 user message missing wrap-up prompt: %q", got)
+	}
+	// The first call must NOT carry the wrap-up prompt — only the final turn does.
+	u0, _ := prov.calls[0].Messages[0].(provider.UserMessage)
+	if got := provider.JoinText(u0.Content); strings.Contains(got, "WRAPUP-MARKER") {
+		t.Fatalf("call 1 user message unexpectedly carries wrap-up prompt: %q", got)
+	}
+}
+
+func TestStepWrapupAllowsToolCycleToComplete(t *testing.T) {
+	t.Parallel()
+	// The wrap-up turn can spend tool calls — termination must wait until the
+	// model returns a non-tool-use stop reason so writes to the program
+	// library actually land.
+	prov := &scriptedProvider{
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "iter1"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{bashToolCall("save", "true")}, StopReason: provider.StopToolUse},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "saved"}}, StopReason: provider.StopEnd},
+		},
+	}
+	a := newTestAgent(t, prov)
+	a.maxIterations = 1
+
+	ctx := context.Background()
+	// Step 1: hits -n cap, no done yet (wrap-up turn pending).
+	if _, done, err := a.Step(ctx); err != nil || done {
+		t.Fatalf("Step 1: err=%v done=%v; want err=nil done=false", err, done)
+	}
+	// Step 2: wrap-up turn, model uses a tool — must not terminate mid-cycle.
+	if _, done, err := a.Step(ctx); err != nil || done {
+		t.Fatalf("Step 2: err=%v done=%v; want err=nil done=false (mid tool cycle)", err, done)
+	}
+	// Step 3: model finishes — now we terminate.
+	if _, done, err := a.Step(ctx); err != nil || !done {
+		t.Fatalf("Step 3: err=%v done=%v; want err=nil done=true", err, done)
+	}
+}
+
+// usageProvider is a scriptedProvider that also lets the test stamp
+// InputTokens on the replayed responses, which is what cycleInputTokenDebt
+// reads to decide when to fire a periodic distill.
+type usageProvider struct {
+	scriptedProvider
+	inputTokens []int // parallel to responses
+}
+
+func (p *usageProvider) Generate(ctx context.Context, sysPrompt string, c provider.Context, opts provider.Options) (provider.AssistantMessage, error) {
+	idx := len(p.calls)
+	msg, err := p.scriptedProvider.Generate(ctx, sysPrompt, c, opts)
+	if err != nil {
+		return msg, err
+	}
+	if idx < len(p.inputTokens) {
+		msg.Usage.InputTokens = p.inputTokens[idx]
+	}
+	return msg, nil
+}
+
+func TestStepFiresPeriodicDistillWhenCycleDebtCrossesThreshold(t *testing.T) {
+	t.Parallel()
+	// Three tool-use Steps with InputTokens above the threshold each. The
+	// first Step accumulates debt that crosses the threshold, so Step 2's
+	// user message must carry the distill prompt. The third Step (still
+	// mid-cycle) should NOT carry it again because debt was decremented by
+	// the threshold on firing and hasn't crossed again yet.
+	bigInput := distillThresholdTokens + 1024
+	prov := &usageProvider{
+		scriptedProvider: scriptedProvider{
+			responses: []provider.AssistantMessage{
+				{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
+				{Content: []provider.AssistantContent{bashToolCall("c2", "true")}, StopReason: provider.StopToolUse},
+				{Content: []provider.AssistantContent{provider.TextContent{Text: "ok"}}, StopReason: provider.StopEnd},
+			},
+		},
+		inputTokens: []int{bigInput, 1024, 1024},
+	}
+	a := newTestAgent(t, prov)
+	writeDistillScript(t, a, "general.sh",
+		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo FINAL-MARKER; else echo DISTILL-MARKER; fi\n")
+
+	ctx := context.Background()
+	runSteps(t, a, 3)
+
+	if got := len(prov.calls); got != 3 {
+		t.Fatalf("provider call count: got %d, want 3", got)
+	}
+	// Call 1: pre-firing — no distill marker.
+	u0, _ := prov.calls[0].Messages[0].(provider.UserMessage)
+	if got := provider.JoinText(u0.Content); strings.Contains(got, "DISTILL-MARKER") {
+		t.Fatalf("call 1 unexpectedly carries distill prompt: %q", got)
+	}
+	// Call 2: armed by Step 1's debt accumulation — distill marker present,
+	// FINAL marker absent (this is a periodic firing, not the wrap-up turn).
+	u1, _ := prov.calls[1].Messages[0].(provider.UserMessage)
+	text1 := provider.JoinText(u1.Content)
+	if !strings.Contains(text1, "DISTILL-MARKER") {
+		t.Fatalf("call 2 missing distill prompt: %q", text1)
+	}
+	if strings.Contains(text1, "FINAL-MARKER") {
+		t.Fatalf("call 2 carries FINAL framing but this is a periodic firing, not wrap-up: %q", text1)
+	}
+	// Call 3: distillPending was cleared on call 2, debt hasn't crossed
+	// threshold again — no firing this Step.
+	u2, _ := prov.calls[2].Messages[0].(provider.UserMessage)
+	if got := provider.JoinText(u2.Content); strings.Contains(got, "DISTILL-MARKER") {
+		t.Fatalf("call 3 unexpectedly re-fires distill: %q", got)
+	}
+	_ = ctx
+}
+
+func TestStepClearsCycleDebtWhenCycleEnds(t *testing.T) {
+	t.Parallel()
+	// A cycle that ends with StopEnd before the threshold is crossed must
+	// reset the debt — the conversation history is wiped on cycle end, so
+	// there is nothing left to distill on the next turn.
+	prov := &usageProvider{
+		scriptedProvider: scriptedProvider{
+			responses: []provider.AssistantMessage{
+				{Content: []provider.AssistantContent{provider.TextContent{Text: "done"}}, StopReason: provider.StopEnd},
+				{Content: []provider.AssistantContent{provider.TextContent{Text: "done"}}, StopReason: provider.StopEnd},
+			},
+		},
+		inputTokens: []int{distillThresholdTokens - 100, 100},
+	}
+	a := newTestAgent(t, prov)
+
+	runSteps(t, a, 2)
+
+	if a.cycleInputTokenDebt != 0 {
+		t.Fatalf("cycleInputTokenDebt should reset to 0 on cycle end, got %d", a.cycleInputTokenDebt)
+	}
+	if a.distillPending {
+		t.Fatalf("distillPending should be false when threshold was never crossed")
+	}
+}
