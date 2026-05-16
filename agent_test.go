@@ -380,8 +380,8 @@ func TestStepGivesAgentWrapupChanceAfterMaxIterations(t *testing.T) {
 	if done {
 		t.Fatalf("Step 1 returned done=true; expected the wrap-up modeling turn to still run")
 	}
-	if a.currentTurnKind != TurnModeling {
-		t.Fatalf("after Step 1: currentTurnKind = %v, want TurnModeling (forced trigger should have scheduled the wrap-up)", a.currentTurnKind)
+	if a.CurrentTurnKind() != TurnModeling {
+		t.Fatalf("after Step 1: currentTurnKind = %v, want TurnModeling (forced trigger should have scheduled the wrap-up)", a.CurrentTurnKind())
 	}
 
 	_, done, err = a.Step(ctx)
@@ -605,8 +605,8 @@ func TestBootstrapModelingTurnFiresOnEmptyLibrary(t *testing.T) {
 	if err := a.Prime(ctx); err != nil {
 		t.Fatalf("Prime: %v", err)
 	}
-	if a.currentTurnKind != TurnModeling || !a.needsBootstrap {
-		t.Fatalf("after Prime with empty programs/: kind=%v bootstrap=%v, want TurnModeling/true", a.currentTurnKind, a.needsBootstrap)
+	if a.CurrentTurnKind() != TurnModeling || !a.needsBootstrap {
+		t.Fatalf("after Prime with empty programs/: kind=%v bootstrap=%v, want TurnModeling/true", a.CurrentTurnKind(), a.needsBootstrap)
 	}
 	if _, _, err := a.Step(ctx); err != nil {
 		t.Fatalf("Step: %v", err)
@@ -626,8 +626,8 @@ func TestBootstrapModelingTurnFiresOnEmptyLibrary(t *testing.T) {
 		t.Fatalf("bootstrap modeling turn unexpectedly carries a prior transcript section: %q", text)
 	}
 	// After the modeling turn closes the agent flips back to work.
-	if a.currentTurnKind != TurnWork {
-		t.Fatalf("after Step: kind=%v, want TurnWork (modeling turn should close)", a.currentTurnKind)
+	if a.CurrentTurnKind() != TurnWork {
+		t.Fatalf("after Step: kind=%v, want TurnWork (modeling turn should close)", a.CurrentTurnKind())
 	}
 }
 
@@ -664,8 +664,8 @@ func TestModelingTurnFiresAfterYield(t *testing.T) {
 	if _, _, err := a.Step(ctx); err != nil {
 		t.Fatalf("Step 2: %v", err)
 	}
-	if a.currentTurnKind != TurnModeling {
-		t.Fatalf("after Step 2 (cycle close after yield): kind=%v, want TurnModeling", a.currentTurnKind)
+	if a.CurrentTurnKind() != TurnModeling {
+		t.Fatalf("after Step 2 (cycle close after yield): kind=%v, want TurnModeling", a.CurrentTurnKind())
 	}
 	// Step 3: the modeling turn runs.
 	if _, _, err := a.Step(ctx); err != nil {
@@ -706,8 +706,8 @@ func TestModelingTurnNotFiredAfterIdleCycle(t *testing.T) {
 	if _, _, err := a.Step(ctx); err != nil {
 		t.Fatalf("Step 1: %v", err)
 	}
-	if a.currentTurnKind != TurnWork {
-		t.Fatalf("after no-tool cycle: kind=%v, want TurnWork (modeling should not fire on idle cycles)", a.currentTurnKind)
+	if a.CurrentTurnKind() != TurnWork {
+		t.Fatalf("after no-tool cycle: kind=%v, want TurnWork (modeling should not fire on idle cycles)", a.CurrentTurnKind())
 	}
 }
 

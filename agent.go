@@ -161,17 +161,17 @@ func NewAgent(prov provider.Provider, root, goal string, maxIterations int) *Age
 	}
 }
 
-// Phase values describe what Step is currently doing. Read by the TUI to
-// drive the phase-indicator strip; written by Step at each transition.
-// PhaseModeling is set while a modeling turn's inferences are running and
-// cleared when the turn closes — distinct from the in-cycle MODELING flash
-// on the drag bar, which signals the yield reinforcement firing.
+// Phase values describe what Step is currently doing — the sub-stage of
+// one inference. Read by the TUI to drive the phase-indicator strip;
+// written by Step at each transition. Phase is the "what is the step doing
+// right now" axis; turn kind (work vs. modeling) is a parallel axis
+// surfaced separately via CurrentTurnKind so the TUI can render both
+// without conflating them.
 const (
 	PhaseIdle uint32 = iota
 	PhaseRunPrograms
 	PhaseInference
 	PhaseTools
-	PhaseModeling
 )
 
 type Agent struct {
@@ -263,8 +263,9 @@ type Agent struct {
 	// currentTurnKind drives which system prompt / user-message shape the
 	// next Step uses. Flipped by the cadence predicate at cycle close
 	// (work → modeling when triggered, modeling → work always after the
-	// modeling turn closes).
-	currentTurnKind TurnKind
+	// modeling turn closes). Stored as an atomic so the TUI can read it
+	// from a separate goroutine without locking against Step.
+	currentTurnKind atomic.Uint32
 
 	// Modeling-turn state.
 	//
@@ -338,6 +339,12 @@ func (a *Agent) ContextBudget() int               { return a.contextBudget }
 // Phase reports the current step phase. Atomically updated by Step so the
 // TUI can render the phase-indicator strip from any goroutine.
 func (a *Agent) Phase() uint32 { return a.phase.Load() }
+
+// CurrentTurnKind reports which kind of turn the next (or in-flight) Step
+// is running as. Atomically updated when the cadence predicate flips
+// between work and modeling, so the TUI can read it concurrently with
+// Step.
+func (a *Agent) CurrentTurnKind() TurnKind { return TurnKind(a.currentTurnKind.Load()) }
 
 // SubscribePhaseChanges returns a channel that receives a non-blocking
 // nudge on every phase transition. Replaces any previous subscription;
@@ -424,7 +431,7 @@ func (a *Agent) Prime(ctx context.Context) error {
 		return err
 	}
 	if empty, err := a.programsDirEmpty(); err == nil && empty {
-		a.currentTurnKind = TurnModeling
+		a.currentTurnKind.Store(uint32(TurnModeling))
 		a.needsBootstrap = true
 		a.preModelingLibraryHash = a.libraryHash()
 	}
@@ -548,7 +555,7 @@ func (a *Agent) libraryHash() [sha256.Size]byte {
 // reached; modeling turns close themselves when the model stops calling
 // tools or the in-turn step cap is exceeded.
 func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, error) {
-	if a.currentTurnKind == TurnModeling {
+	if a.CurrentTurnKind() == TurnModeling {
 		return a.stepModeling(ctx)
 	}
 	return a.stepWork(ctx)
@@ -748,7 +755,7 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 		a.maybeScheduleModelingTurn(prevStopReason)
 		// If no modeling turn was scheduled but we just closed the wrap-up
 		// cycle, the run terminates here.
-		if a.currentTurnKind == TurnWork && a.finalPhase {
+		if a.CurrentTurnKind() == TurnWork && a.finalPhase {
 			done = true
 		}
 	}
@@ -765,8 +772,9 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 // back to TurnWork, no-op suppression is evaluated, and on the final-phase
 // path done=true is returned.
 func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bool, error) {
-	a.setPhase(PhaseModeling)
-
+	// The turn-kind axis (work vs. modeling) is surfaced via
+	// CurrentTurnKind; the phase axis still tracks the step's sub-stage
+	// (RunPrograms → Inference → Tools), set below.
 	var history []provider.Message
 	// History preservation inside the modeling turn mirrors the work cycle:
 	// while the model is mid tool-using (StopToolUse), keep its prior
@@ -860,7 +868,7 @@ func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bo
 	if turnClosed {
 		postHash := a.libraryHash()
 		a.modelingNoOpSuppressed = postHash == a.preModelingLibraryHash
-		a.currentTurnKind = TurnWork
+		a.currentTurnKind.Store(uint32(TurnWork))
 		a.modelingStepsThisTurn = 0
 		a.workCycleTranscript = nil
 		a.needsBootstrap = false
@@ -919,7 +927,7 @@ func (a *Agent) maybeScheduleModelingTurn(prevStopReason provider.StopReason) {
 		return
 	}
 
-	a.currentTurnKind = TurnModeling
+	a.currentTurnKind.Store(uint32(TurnModeling))
 	transcript := make([]provider.Message, 0, len(a.conversation))
 	if len(a.conversation) > 1 {
 		transcript = append(transcript, a.conversation[1:]...)
@@ -1391,7 +1399,7 @@ func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, erro
 	if err != nil {
 		return nil, err
 	}
-	if a.currentTurnKind == TurnModeling {
+	if a.CurrentTurnKind() == TurnModeling {
 		return []provider.Message{a.assembleModelingUserMessage(data, nil, a.needsBootstrap, false)}, nil
 	}
 	return []provider.Message{a.assembleUserMessage(data, false, false)}, nil

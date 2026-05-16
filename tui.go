@@ -223,6 +223,12 @@ var (
 	barEmpty     = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	flashStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 
+	// Turn-kind badge styles. Work is the muted resting state; modeling
+	// is bright so the operator can tell at a glance which kind of turn
+	// the dashboard's pips belong to.
+	turnWorkBadgeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	turnModelingBadgeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
+
 	// Library segments alternate through this palette so adjacent
 	// active programs are visually distinguishable even when their
 	// segments are all "active, unchanged". Hand-picked greens with
@@ -264,7 +270,6 @@ func (m tuiModel) renderPhase(width int) string {
 		{PhaseRunPrograms, "running programs"},
 		{PhaseInference, "inference"},
 		{PhaseTools, "tools"},
-		{PhaseModeling, "modeling"},
 		{PhaseIdle, "idle"},
 	}
 	var parts []string
@@ -277,7 +282,13 @@ func (m tuiModel) renderPhase(width int) string {
 		}
 		parts = append(parts, style.Render(mark)+" "+pipLabel.Render(p.label))
 	}
-	left := strings.Join(parts, "   ")
+	// Turn kind is a parallel axis to the phase: a modeling turn still
+	// walks through RunPrograms → Inference → Tools, but the operator
+	// wants to know which kind of turn those sub-stages belong to. Render
+	// it as a sustained badge alongside the pips rather than mixing it
+	// into the phase enum.
+	turnBadge := turnKindBadge(m.agent.CurrentTurnKind())
+	left := strings.Join(parts, "   ") + "   " + turnBadge
 	right := infoStyle.Render(fmt.Sprintf("cycles: %d", m.agent.ToolCycles()))
 	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
 	if pad < 1 {
@@ -556,6 +567,16 @@ func (m tuiModel) renderAssistant(width int) string {
 		return mutedStyle.Render("(waiting for first response)")
 	}
 	return asstStyle.Width(width).Render(text)
+}
+
+// turnKindBadge renders the current turn kind as a sustained badge for
+// the phase strip. Phase pips describe the sub-stage of one inference;
+// this badge describes which kind of turn that inference is part of.
+func turnKindBadge(k TurnKind) string {
+	if k == TurnModeling {
+		return turnModelingBadgeStyle.Render("◆ MODELING")
+	}
+	return turnWorkBadgeStyle.Render("◇ work")
 }
 
 func latestAssistantText(conversation []provider.Message) string {
