@@ -254,7 +254,7 @@ func buildProvider(name, model string) (provider.Provider, error) {
 }
 
 func extractAssets(dest string) error {
-	return fs.WalkDir(assetsFS, "assets", func(p string, d fs.DirEntry, err error) error {
+	if err := fs.WalkDir(assetsFS, "assets", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -278,7 +278,19 @@ func extractAssets(dest string) error {
 		case parts[0] == "reinforcement" && len(parts) > 2:
 			// Files inside reinforcement/<tool>/ are executable programs.
 			mode = 0755
+		case parts[0] == "system":
+			// Files inside system/ are executable scripts the harness runs
+			// at startup to compose the per-mode system prompts.
+			mode = 0755
 		}
 		return os.WriteFile(target, data, mode)
-	})
+	}); err != nil {
+		return err
+	}
+	// programs/ is no longer shipped with content (the cornerstone was
+	// retired with the dedicated modeling turn design — the bootstrap
+	// modeling turn now installs the initial library). Ensure the
+	// directory exists so the harness can read it on the first run and so
+	// looksLikeProbeDir keeps recognizing the directory layout.
+	return os.MkdirAll(filepath.Join(dest, "programs"), 0755)
 }

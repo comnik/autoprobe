@@ -129,17 +129,22 @@ func (t *Tracer) WriteRunHeader(h RunHeader) error {
 
 // iterationLogEntry is the JSON shape of a non-header line in log.jsonl.
 // It's a summary — enough for the viewer's left rail without forcing the
-// viewer to fetch the per-iteration file just to render the list.
+// viewer to fetch the per-iteration file just to render the list. TurnKind
+// distinguishes work iterations from modeling turns so the rail can badge
+// them differently; records without the field render as "work" for
+// backward compatibility.
 type iterationLogEntry struct {
 	Kind                string    `json:"kind"`
 	N                   int       `json:"n"`
+	WorkIteration       int       `json:"work_iteration"`
+	TurnKind            string    `json:"turn_kind"`
 	File                string    `json:"file"`
 	StartedAt           time.Time `json:"started_at"`
 	DurationMs          int64     `json:"duration_ms"`
 	StopReason          string    `json:"stop_reason"`
 	Overflowed          bool      `json:"overflowed"`
 	RevisionPromptFired bool      `json:"revision_prompt_fired"`
-	DistillPromptFired  bool      `json:"distill_prompt_fired"`
+	ModelingPromptFired bool      `json:"modeling_prompt_fired"`
 	IdlePollsBefore     int       `json:"idle_polls_before"`
 	InputTokens         int       `json:"input_tokens"`
 	OutputTokens        int       `json:"output_tokens"`
@@ -148,9 +153,18 @@ type iterationLogEntry struct {
 // IterationTrace is the in-memory shape passed to the renderer — the
 // exhaustive per-iteration slice the viewer turns into iter-NNNNN.html.
 // Built by the agent at the tail of Step and handed to WriteIteration.
+//
+// Iteration is the monotonic trace-record number (advances on every Step,
+// work or modeling) so iter-NNNNN.html filenames stay unique across
+// interleaved turn kinds. WorkIteration is the work-iteration counter
+// (advances only on work Steps); modeling-turn records carry the value of
+// the last completed work iteration. TurnKind is "work" or "modeling";
+// records written by older autoprobe versions render as "work" by default.
 type IterationTrace struct {
 	FormatVersion   int                      `json:"format_version"`
 	Iteration       int                      `json:"iteration"`
+	WorkIteration   int                      `json:"work_iteration"`
+	TurnKind        string                   `json:"turn_kind"`
 	StartedAt       time.Time                `json:"started_at"`
 	CompletedAt     time.Time                `json:"completed_at"`
 	IdlePollsBefore int                      `json:"idle_polls_before"`
@@ -235,7 +249,7 @@ type TraceBudget struct {
 	UsedTokens              int  `json:"used_tokens"`
 	Overflowed              bool `json:"overflowed"`
 	RevisionPromptFired     bool `json:"revision_prompt_fired"`
-	DistillPromptFired      bool `json:"distill_prompt_fired"`
+	ModelingPromptFired      bool `json:"modeling_prompt_fired"`
 	ActiveBudgetTokens      int  `json:"active_budget_tokens"`
 	ExplorationBudgetTokens int  `json:"exploration_budget_tokens"`
 }
@@ -258,13 +272,15 @@ func (t *Tracer) WriteIteration(rec IterationTrace) error {
 	entry := iterationLogEntry{
 		Kind:                "iteration",
 		N:                   rec.Iteration,
+		WorkIteration:       rec.WorkIteration,
+		TurnKind:            rec.TurnKind,
 		File:                iterationHTMLName(rec.Iteration),
 		StartedAt:           rec.StartedAt,
 		DurationMs:          rec.CompletedAt.Sub(rec.StartedAt).Milliseconds(),
 		StopReason:          rec.Response.StopReason,
 		Overflowed:          rec.Budget.Overflowed,
 		RevisionPromptFired: rec.Budget.RevisionPromptFired,
-		DistillPromptFired:  rec.Budget.DistillPromptFired,
+		ModelingPromptFired: rec.Budget.ModelingPromptFired,
 		IdlePollsBefore:     rec.IdlePollsBefore,
 		InputTokens:         rec.Response.Usage.InputTokens,
 		OutputTokens:        rec.Response.Usage.OutputTokens,

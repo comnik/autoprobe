@@ -344,12 +344,12 @@ func TestStepMixedCycleResetsOnlyAfterStopEnd(t *testing.T) {
 	}
 }
 
-// writeDistillScript drops a distill reinforcement script into the agent's
-// reinforcement/distill/ directory. Mirror of writeRevisionScript from
+// writeModelingScript drops a modeling reinforcement script into the agent's
+// reinforcement/modeling/ directory. Mirror of writeRevisionScript from
 // budget_test.go (kept local rather than exporting that helper).
-func writeDistillScript(t *testing.T, a *Agent, name, body string) {
+func writeModelingScript(t *testing.T, a *Agent, name, body string) {
 	t.Helper()
-	dir := filepath.Join(a.reinforcementDir, distillReinforcementName)
+	dir := filepath.Join(a.reinforcementDir, modelingReinforcementName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -360,8 +360,9 @@ func writeDistillScript(t *testing.T, a *Agent, name, body string) {
 
 func TestStepGivesAgentWrapupChanceAfterMaxIterations(t *testing.T) {
 	t.Parallel()
-	// -n is 1, so iteration 1 hits the cap. We expect a final wrap-up turn
-	// where the user message carries the wrap-up prompt, then termination.
+	// -n is 1, so iteration 1 hits the cap. We expect a final wrap-up
+	// modeling turn (forced trigger) where the user message carries the
+	// FINAL guidance block, then termination.
 	prov := &scriptedProvider{
 		responses: []provider.AssistantMessage{
 			{Content: []provider.AssistantContent{provider.TextContent{Text: "iter1"}}, StopReason: provider.StopEnd},
@@ -370,11 +371,6 @@ func TestStepGivesAgentWrapupChanceAfterMaxIterations(t *testing.T) {
 	}
 	a := newTestAgent(t, prov)
 	a.maxIterations = 1
-	// The wrap-up turn forces a distill firing with $AUTOPROBE_FINAL=1 set,
-	// so the test script branches on it to emit a marker only on the wrap-up
-	// firing. That way we also check that the final-phase env signal lands.
-	writeDistillScript(t, a, "general.sh",
-		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo WRAPUP-MARKER; fi\n")
 
 	ctx := context.Background()
 	_, done, err := a.Step(ctx)
@@ -382,7 +378,10 @@ func TestStepGivesAgentWrapupChanceAfterMaxIterations(t *testing.T) {
 		t.Fatalf("Step 1: %v", err)
 	}
 	if done {
-		t.Fatalf("Step 1 returned done=true; expected the wrap-up turn to still run")
+		t.Fatalf("Step 1 returned done=true; expected the wrap-up modeling turn to still run")
+	}
+	if a.CurrentTurnKind() != TurnModeling {
+		t.Fatalf("after Step 1: currentTurnKind = %v, want TurnModeling (forced trigger should have scheduled the wrap-up)", a.CurrentTurnKind())
 	}
 
 	_, done, err = a.Step(ctx)
@@ -390,24 +389,33 @@ func TestStepGivesAgentWrapupChanceAfterMaxIterations(t *testing.T) {
 		t.Fatalf("Step 2: %v", err)
 	}
 	if !done {
-		t.Fatalf("Step 2 returned done=false; expected termination after wrap-up turn")
+		t.Fatalf("Step 2 returned done=false; expected termination after wrap-up modeling turn")
 	}
 
 	if got := len(prov.calls); got != 2 {
 		t.Fatalf("provider call count: got %d, want 2", got)
 	}
-	// The wrap-up prompt must reach the model on the final turn.
+	// The wrap-up modeling turn's user message must carry the FINAL
+	// guidance and the prior cycle's transcript.
 	u, ok := prov.calls[1].Messages[0].(provider.UserMessage)
 	if !ok {
 		t.Fatalf("call 2 message 1: got %T, want UserMessage", prov.calls[1].Messages[0])
 	}
-	if got := provider.JoinText(u.Content); !strings.Contains(got, "WRAPUP-MARKER") {
-		t.Fatalf("call 2 user message missing wrap-up prompt: %q", got)
+	got := provider.JoinText(u.Content)
+	if !strings.Contains(got, "MODELING GUIDANCE — FINAL") {
+		t.Fatalf("call 2 user message missing FINAL guidance: %q", got)
 	}
-	// The first call must NOT carry the wrap-up prompt — only the final turn does.
+	if !strings.Contains(got, "PRIOR WORK CYCLE TRANSCRIPT") {
+		t.Fatalf("call 2 user message missing prior transcript section: %q", got)
+	}
+	if !strings.Contains(got, "iter1") {
+		t.Fatalf("call 2 user message missing prior cycle's assistant text: %q", got)
+	}
+	// The first call must NOT carry the FINAL framing — only the wrap-up
+	// modeling turn does.
 	u0, _ := prov.calls[0].Messages[0].(provider.UserMessage)
-	if got := provider.JoinText(u0.Content); strings.Contains(got, "WRAPUP-MARKER") {
-		t.Fatalf("call 1 user message unexpectedly carries wrap-up prompt: %q", got)
+	if got := provider.JoinText(u0.Content); strings.Contains(got, "MODELING GUIDANCE — FINAL") {
+		t.Fatalf("call 1 user message unexpectedly carries FINAL guidance: %q", got)
 	}
 }
 
@@ -442,7 +450,7 @@ func TestStepWrapupAllowsToolCycleToComplete(t *testing.T) {
 }
 
 // usageProvider is a scriptedProvider that also lets the test stamp
-// InputTokens on the replayed responses, which is what the per-Step distill
+// InputTokens on the replayed responses, which is what the per-Step modeling
 // threshold check reads.
 type usageProvider struct {
 	scriptedProvider
@@ -463,7 +471,7 @@ func (p *usageProvider) Generate(ctx context.Context, sysPrompt string, c provid
 
 // lastToolResultText returns the trailing TextContent of the most recent
 // ToolResultMessage in a provider call's input messages — that's where a
-// periodic distill firing lands and what the model will see right before
+// periodic modeling firing lands and what the model will see right before
 // generating its next response.
 func lastToolResultText(t *testing.T, msgs []provider.Message) string {
 	t.Helper()
@@ -475,13 +483,13 @@ func lastToolResultText(t *testing.T, msgs []provider.Message) string {
 	return ""
 }
 
-func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
+func TestStepFiresPeriodicModelingIntoLastToolResult(t *testing.T) {
 	t.Parallel()
-	// Step 1's InputTokens crosses the threshold on its own, so the distill
+	// Step 1's InputTokens crosses the threshold on its own, so the modeling
 	// prompt must be appended to Step 1's tool result — Step 2's input then
 	// carries it at the tail. Step 2 also crosses the threshold but cooldown
 	// suppresses the second firing.
-	bigInput := distillThresholdTokens + 1024
+	bigInput := modelingThresholdTokens + 1024
 	prov := &usageProvider{
 		scriptedProvider: scriptedProvider{
 			responses: []provider.AssistantMessage{
@@ -493,8 +501,8 @@ func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
 		inputTokens: []int{bigInput, bigInput, 1024},
 	}
 	a := newTestAgent(t, prov)
-	writeDistillScript(t, a, "general.sh",
-		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo FINAL-MARKER; else echo DISTILL-MARKER; fi\n")
+	writeModelingScript(t, a, "general.sh",
+		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo FINAL-MARKER; else echo MODELING-MARKER; fi\n")
 
 	runSteps(t, a, 3)
 
@@ -503,10 +511,10 @@ func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
 		t.Fatalf("call 1 unexpectedly already has a tool result: %q", got)
 	}
 	// Call 2 input: should contain the tool result from Step 1 with the
-	// distill prompt appended at its tail.
+	// modeling prompt appended at its tail.
 	got2 := lastToolResultText(t, prov.calls[1].Messages)
-	if !strings.Contains(got2, "DISTILL-MARKER") {
-		t.Fatalf("call 2 last tool result missing distill prompt: %q", got2)
+	if !strings.Contains(got2, "MODELING-MARKER") {
+		t.Fatalf("call 2 last tool result missing modeling prompt: %q", got2)
 	}
 	if strings.Contains(got2, "FINAL-MARKER") {
 		t.Fatalf("call 2 carries FINAL framing but this is a periodic firing: %q", got2)
@@ -514,7 +522,7 @@ func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
 	// Call 3 input: the tool result from Step 2 must NOT carry the prompt —
 	// we are inside the cooldown window even though Step 2 also crossed.
 	got3 := lastToolResultText(t, prov.calls[2].Messages)
-	if strings.Contains(got3, "DISTILL-MARKER") {
+	if strings.Contains(got3, "MODELING-MARKER") {
 		t.Fatalf("call 3 last tool result fired during cooldown: %q", got3)
 	}
 }
@@ -531,7 +539,7 @@ func TestStepRunsFreshInferenceAfterCycleEndsEvenIfProgramsStable(t *testing.T) 
 	prov := &scriptedProvider{
 		responses: []provider.AssistantMessage{
 			{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
-			{Content: []provider.AssistantContent{provider.TextContent{Text: "distilling and yielding"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "modelinging and yielding"}}, StopReason: provider.StopEnd},
 			{Content: []provider.AssistantContent{provider.TextContent{Text: "still done"}}, StopReason: provider.StopEnd},
 		},
 	}
@@ -574,12 +582,141 @@ func TestStepIdlesAfterRepeatedYieldsWithStableHash(t *testing.T) {
 	}
 }
 
-func TestStepClearsDistillCooldownWhenCycleEnds(t *testing.T) {
+func TestBootstrapModelingTurnFiresOnEmptyLibrary(t *testing.T) {
 	t.Parallel()
-	// A cycle that fires the distill prompt and then ends naturally must
+	// Empty programs/ at Prime time arms the bootstrap modeling turn: the
+	// first Step runs as a modeling turn (not a work step) and the user
+	// message carries the BOOTSTRAP guidance rather than the regular one.
+	prov := &scriptedProvider{
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "installed initial programs"}}, StopReason: provider.StopEnd},
+		},
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "programs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "reinforcement"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	a := NewAgent(prov, root, "", 0)
+
+	ctx := context.Background()
+	if err := a.Prime(ctx); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	if a.CurrentTurnKind() != TurnModeling || !a.needsBootstrap {
+		t.Fatalf("after Prime with empty programs/: kind=%v bootstrap=%v, want TurnModeling/true", a.CurrentTurnKind(), a.needsBootstrap)
+	}
+	if _, _, err := a.Step(ctx); err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	if got := len(prov.calls); got != 1 {
+		t.Fatalf("provider call count: got %d, want 1", got)
+	}
+	u, ok := prov.calls[0].Messages[0].(provider.UserMessage)
+	if !ok {
+		t.Fatalf("call 1 message 1: got %T, want UserMessage", prov.calls[0].Messages[0])
+	}
+	text := provider.JoinText(u.Content)
+	if !strings.Contains(text, "MODELING GUIDANCE — BOOTSTRAP") {
+		t.Fatalf("bootstrap modeling turn missing BOOTSTRAP guidance: %q", text)
+	}
+	if strings.Contains(text, "PRIOR WORK CYCLE TRANSCRIPT") {
+		t.Fatalf("bootstrap modeling turn unexpectedly carries a prior transcript section: %q", text)
+	}
+	// After the modeling turn closes the agent flips back to work.
+	if a.CurrentTurnKind() != TurnWork {
+		t.Fatalf("after Step: kind=%v, want TurnWork (modeling turn should close)", a.CurrentTurnKind())
+	}
+}
+
+func TestModelingTurnFiresAfterYield(t *testing.T) {
+	t.Parallel()
+	// A work cycle that fires the in-cycle yield reinforcement should
+	// schedule a modeling turn between work cycles. The default trigger
+	// fires only when the cycle actually used tools.
+	bigInput := modelingThresholdTokens + 1024
+	prov := &usageProvider{
+		scriptedProvider: scriptedProvider{
+			responses: []provider.AssistantMessage{
+				{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
+				{Content: []provider.AssistantContent{provider.TextContent{Text: "yielding"}}, StopReason: provider.StopEnd},
+				{Content: []provider.AssistantContent{provider.TextContent{Text: "library curation done"}}, StopReason: provider.StopEnd},
+			},
+		},
+		inputTokens: []int{bigInput, bigInput, 1024},
+	}
+	a := newTestAgent(t, prov)
+	writeModelingScript(t, a, "general.sh",
+		"#!/bin/sh\necho YIELD-MARKER\n")
+
+	ctx := context.Background()
+	// Step 1: tool call, yield fires (drag > threshold).
+	if _, _, err := a.Step(ctx); err != nil {
+		t.Fatalf("Step 1: %v", err)
+	}
+	if !a.yieldFiredThisCycle {
+		t.Fatalf("yieldFiredThisCycle should be set after Step 1's threshold crossing")
+	}
+	// Step 2: cycle closes (StopEnd). At cycle close, the cadence
+	// predicate should schedule a modeling turn for the next Step.
+	if _, _, err := a.Step(ctx); err != nil {
+		t.Fatalf("Step 2: %v", err)
+	}
+	if a.CurrentTurnKind() != TurnModeling {
+		t.Fatalf("after Step 2 (cycle close after yield): kind=%v, want TurnModeling", a.CurrentTurnKind())
+	}
+	// Step 3: the modeling turn runs.
+	if _, _, err := a.Step(ctx); err != nil {
+		t.Fatalf("Step 3: %v", err)
+	}
+	if got := len(prov.calls); got != 3 {
+		t.Fatalf("provider call count: got %d, want 3", got)
+	}
+	// Call 3 was the modeling turn: its user message carries the modeling
+	// guidance block.
+	u, _ := prov.calls[2].Messages[0].(provider.UserMessage)
+	if got := provider.JoinText(u.Content); !strings.Contains(got, "MODELING GUIDANCE") {
+		t.Fatalf("call 3 (modeling turn) missing guidance: %q", got)
+	}
+	// Calls 1 and 2 (work steps) must not carry the modeling guidance.
+	for i, c := range prov.calls[:2] {
+		u, _ := c.Messages[0].(provider.UserMessage)
+		if got := provider.JoinText(u.Content); strings.Contains(got, "MODELING GUIDANCE") {
+			t.Fatalf("call %d (work step) unexpectedly carries modeling guidance: %q", i+1, got)
+		}
+	}
+}
+
+func TestModelingTurnNotFiredAfterIdleCycle(t *testing.T) {
+	t.Parallel()
+	// A work cycle that closes without ever invoking a tool (one StopEnd
+	// response with no tool calls) is an "idle" cycle — nothing happened
+	// that could have moved the model, so the cadence skips it even
+	// though the cycle closed.
+	prov := &scriptedProvider{
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "no work to do"}}, StopReason: provider.StopEnd},
+		},
+	}
+	a := newTestAgent(t, prov)
+
+	ctx := context.Background()
+	if _, _, err := a.Step(ctx); err != nil {
+		t.Fatalf("Step 1: %v", err)
+	}
+	if a.CurrentTurnKind() != TurnWork {
+		t.Fatalf("after no-tool cycle: kind=%v, want TurnWork (modeling should not fire on idle cycles)", a.CurrentTurnKind())
+	}
+}
+
+func TestStepClearsModelingCooldownWhenCycleEnds(t *testing.T) {
+	t.Parallel()
+	// A cycle that fires the modeling prompt and then ends naturally must
 	// clear the cooldown — the next cycle starts with a fresh history slate
 	// and should be allowed to fire on its own merits.
-	bigInput := distillThresholdTokens + 1024
+	bigInput := modelingThresholdTokens + 1024
 	prov := &usageProvider{
 		scriptedProvider: scriptedProvider{
 			responses: []provider.AssistantMessage{
@@ -593,7 +730,7 @@ func TestStepClearsDistillCooldownWhenCycleEnds(t *testing.T) {
 
 	runSteps(t, a, 2)
 
-	if a.distillCooldown != 0 {
-		t.Fatalf("distillCooldown should reset to 0 on cycle end, got %d", a.distillCooldown)
+	if a.modelingCooldown != 0 {
+		t.Fatalf("modelingCooldown should reset to 0 on cycle end, got %d", a.modelingCooldown)
 	}
 }

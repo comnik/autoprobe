@@ -50,30 +50,99 @@ const (
 	revisionReinforcementName = "revision"
 
 	// Pseudo-tool name under reinforcement/ whose scripts emit the
-	// distillation prompt — a nudge for the agent to compress what it has
+	// modeling prompt — a nudge for the agent to compress what it has
 	// learned during a tool-use cycle into a program. Fires when a Step's
-	// in-cycle drag crosses distillThresholdTokens, and is forced on the
+	// in-cycle drag crosses modelingThresholdTokens, and is forced on the
 	// wrap-up turn when -n is exhausted (with $AUTOPROBE_FINAL=1 set so the
 	// script can emit last-chance framing).
-	distillReinforcementName = "distill"
+	modelingReinforcementName = "modeling"
 
 	// Inside a tool-use cycle, the non-program portion of an inference's
 	// input (InputTokens − the program-output portion of the user message)
 	// is what the model is paying to drag prior history forward. When that
-	// crosses this threshold on a single Step, the distill prompt is appended
+	// crosses this threshold on a single Step, the modeling prompt is appended
 	// to that Step's last tool result so the model sees the nudge attached
 	// to what it is reacting to. The threshold doubles as the working-set
 	// alarm: ≈16 pages (2K each) of in-cycle drag is enough that compressing
 	// to a program saves more on every subsequent inference than the
 	// compression itself costs.
-	distillThresholdTokens = 32 * 1024
+	modelingThresholdTokens = 32 * 1024
 
-	// Steps to wait after a periodic distill firing before considering the
+	// Steps to wait after a periodic modeling firing before considering the
 	// next one. Without this, once history exceeds the threshold every
 	// subsequent Step would re-fire, since the per-Step drag stays above the
 	// threshold until the model actually ends the cycle.
-	distillCooldownSteps = 5
+	modelingCooldownSteps = 5
+
+	// Maximum number of inference sub-steps inside one modeling turn before
+	// the harness force-closes it. Mirrors the work cycle's existing
+	// protections so a runaway modeling turn cannot block forward progress.
+	modelingTurnStepCap = 8
+
+	// Periodic safety net: force a modeling turn after this many consecutive
+	// work cycles with no other trigger, so long quiet phases still get
+	// curated.
+	modelingPeriodicWorkCycles = 10
 )
+
+// TurnKind distinguishes a work turn (pursue the user goal) from a modeling
+// turn (review the prior work cycle and update the library accordingly).
+// Threaded through Step so the harness composes the right system prompt,
+// builds the right user message, and tags the trace.
+type TurnKind int
+
+const (
+	TurnWork TurnKind = iota
+	TurnModeling
+)
+
+func (k TurnKind) String() string {
+	if k == TurnModeling {
+		return "modeling"
+	}
+	return "work"
+}
+
+// modelingGuidance is the user-message guidance block appended to every
+// modeling turn after the program-output region and the prior work cycle's
+// transcript. Inline rather than a script for the first cut so the
+// implementation diff stays focused; promote to an asset if it grows.
+const modelingGuidance = `[MODELING GUIDANCE]
+Use this turn to update the program library so it reflects what the prior
+work cycle revealed about the environment:
+- Compress repeated reads or bash commands into programs that emit the same
+  information on the next iteration's first dashboard.
+- Tighten verbose program outputs that took disproportionate context.
+- Edit ` + "`.autoprobe/inactive`" + ` to demote programs that are not pulling their
+  weight (demotion is reversible; deletion is permanent).
+- Encode any new invariants the cycle revealed as programs that exit
+  non-zero when they are violated.
+
+When done, respond with a brief plain-text summary and NO further tool calls.`
+
+const modelingBootstrapGuidance = `[MODELING GUIDANCE — BOOTSTRAP]
+The program library is empty (or contains only an inline goal probe). This
+is the bootstrap modeling turn before the first work iteration. Install
+initial programs that model the parts of the environment relevant to the
+goal — what's in the repository, what builds, what passes, what's broken —
+so the first work iteration starts from a real dashboard rather than a
+blank one.
+
+When you have installed enough to give the first work cycle traction,
+respond with a brief plain-text summary and NO further tool calls.`
+
+const modelingFinalGuidance = `[MODELING GUIDANCE — FINAL]
+The iteration budget configured with -n has been reached. This is the
+wrap-up modeling turn before the harness terminates the run. Anything not
+written to disk now will be lost — your conversation history does not
+survive. Use this turn to:
+
+- Capture any new understanding of the environment as an executable program.
+- Update or fix programs that produced misleading output during this run.
+- Record the solution — if you converged on one — as a program so the next
+  run can pick up from where this one left off.
+
+When done, respond with a brief plain-text summary and NO further tool calls.`
 
 func NewAgent(prov provider.Provider, root, goal string, maxIterations int) *Agent {
 	if abs, err := filepath.Abs(root); err == nil {
@@ -92,8 +161,12 @@ func NewAgent(prov provider.Provider, root, goal string, maxIterations int) *Age
 	}
 }
 
-// Phase values describe what Step is currently doing. Read by the TUI to
-// drive the phase-indicator strip; written by Step at each transition.
+// Phase values describe what Step is currently doing — the sub-stage of
+// one inference. Read by the TUI to drive the phase-indicator strip;
+// written by Step at each transition. Phase is the "what is the step doing
+// right now" axis; turn kind (work vs. modeling) is a parallel axis
+// surfaced separately via CurrentTurnKind so the TUI can render both
+// without conflating them.
 const (
 	PhaseIdle uint32 = iota
 	PhaseRunPrograms
@@ -131,7 +204,7 @@ type Agent struct {
 
 	// finalPhase flips true on the first substantive Step that hits the -n cap
 	// and stays true for the remainder of the run. While set, Step skips idle
-	// backoff and forces a distill firing on the next user message (with
+	// backoff and forces a modeling firing on the next user message (with
 	// $AUTOPROBE_FINAL=1 so the prompt can carry last-chance framing). The
 	// run terminates once the model returns a non-tool-use stop reason on
 	// (or after) entering this phase.
@@ -142,7 +215,7 @@ type Agent struct {
 	// check is suppressed. Zeroed on cycle end. The wrap-up firing bypasses
 	// cooldown because it goes through the user-message path, not the
 	// tool-result path.
-	distillCooldown int
+	modelingCooldown int
 
 	// prevOutputs is a session-local buffer of each program's last-
 	// iteration output, used to compute change frequency, change amount,
@@ -175,10 +248,64 @@ type Agent struct {
 	lastProgramTokens atomic.Int64
 	lastDrag          atomic.Int64
 	inToolCycle       atomic.Bool
-	distillFiredAtNs  atomic.Int64
+	modelingFiredAtNs  atomic.Int64
 
 	snapshotMu   sync.Mutex
 	lastSnapshot []ProgramSnapshot
+
+	// Per-mode system prompts composed at Prime time from assets/system/
+	// identity.sh plus the mode-specific add-on (work.sh or modeling.sh).
+	// Held byte-stable thereafter so the provider's system-slot cache
+	// breakpoint stays hot across iterations.
+	workSystemPrompt     string
+	modelingSystemPrompt string
+
+	// currentTurnKind drives which system prompt / user-message shape the
+	// next Step uses. Flipped by the cadence predicate at cycle close
+	// (work → modeling when triggered, modeling → work always after the
+	// modeling turn closes). Stored as an atomic so the TUI can read it
+	// from a separate goroutine without locking against Step.
+	currentTurnKind atomic.Uint32
+
+	// Modeling-turn state.
+	//
+	// modelingStepsThisTurn counts inference sub-steps inside one modeling
+	// turn so the harness can enforce modelingTurnStepCap.
+	//
+	// workCycleTranscript is the prior work cycle's conversation tail
+	// (everything after the leading user message), captured at the moment
+	// that cycle closed and embedded into the first modeling step's user
+	// message. Discarded when the modeling turn closes.
+	//
+	// preModelingLibraryHash captures programs/ + inactive at the start of
+	// a modeling turn so the harness can detect a no-op modeling turn
+	// (nothing changed → suppress the next firing on the same stale signal).
+	//
+	// modelingNoOpSuppressed is set when the previous modeling turn made no
+	// library changes; cleared by any fresh trigger condition firing again.
+	//
+	// workCyclesSinceModeling counts consecutive closed work cycles since
+	// the last modeling turn; once it hits modelingPeriodicWorkCycles, the
+	// periodic safety-net trigger fires.
+	//
+	// yieldFiredThisCycle mirrors modelingFiredAtNs scoped to the
+	// just-closed work cycle — the cadence predicate reads it once at
+	// cycle close to decide whether the default trigger fires.
+	//
+	// needsBootstrap marks the very first modeling turn so the user-message
+	// guidance switches to bootstrap framing (no prior cycle to review).
+	modelingStepsThisTurn   int
+	workCycleTranscript     []provider.Message
+	preModelingLibraryHash  [sha256.Size]byte
+	modelingNoOpSuppressed  bool
+	workCyclesSinceModeling int
+	yieldFiredThisCycle     bool
+	needsBootstrap          bool
+
+	// traceSeq is the monotonic record counter for trace writes. Advances
+	// on every Step (work or modeling) so each iter-NNNNN.html filename is
+	// unique even when modeling turns interleave with work iterations.
+	traceSeq int
 }
 
 // ProgramSnapshot is one program's state in the most recent iteration —
@@ -212,6 +339,12 @@ func (a *Agent) ContextBudget() int               { return a.contextBudget }
 // Phase reports the current step phase. Atomically updated by Step so the
 // TUI can render the phase-indicator strip from any goroutine.
 func (a *Agent) Phase() uint32 { return a.phase.Load() }
+
+// CurrentTurnKind reports which kind of turn the next (or in-flight) Step
+// is running as. Atomically updated when the cadence predicate flips
+// between work and modeling, so the TUI can read it concurrently with
+// Step.
+func (a *Agent) CurrentTurnKind() TurnKind { return TurnKind(a.currentTurnKind.Load()) }
 
 // SubscribePhaseChanges returns a channel that receives a non-blocking
 // nudge on every phase transition. Replaces any previous subscription;
@@ -255,11 +388,11 @@ func (a *Agent) LastDrag() (drag int, valid bool) {
 	return int(a.lastDrag.Load()), a.inToolCycle.Load()
 }
 
-// LastDistillFiredAt returns the wall-clock time of the most recent
-// distill firing, or the zero time if none has fired yet. The TUI uses
+// LastModelingFiredAt returns the wall-clock time of the most recent
+// modeling firing, or the zero time if none has fired yet. The TUI uses
 // the recency to drive the bar flash.
-func (a *Agent) LastDistillFiredAt() time.Time {
-	n := a.distillFiredAtNs.Load()
+func (a *Agent) LastModelingFiredAt() time.Time {
+	n := a.modelingFiredAtNs.Load()
 	if n == 0 {
 		return time.Time{}
 	}
@@ -290,8 +423,18 @@ func (a *Agent) Run(ctx context.Context) error {
 	return runTUI(ctx, a)
 }
 
-// Prime builds the initial conversation. Must be called once before Step.
+// Prime loads the per-mode system prompts, arms the bootstrap modeling
+// turn if the program library is empty, and builds the initial
+// conversation. Must be called once before Step.
 func (a *Agent) Prime(ctx context.Context) error {
+	if err := a.loadSystemPrompts(); err != nil {
+		return err
+	}
+	if empty, err := a.programsDirEmpty(); err == nil && empty {
+		a.currentTurnKind.Store(uint32(TurnModeling))
+		a.needsBootstrap = true
+		a.preModelingLibraryHash = a.libraryHash()
+	}
 	c, err := a.buildConversation(ctx)
 	if err != nil {
 		return err
@@ -300,15 +443,131 @@ func (a *Agent) Prime(ctx context.Context) error {
 	return nil
 }
 
-// Step runs a single inference + tool execution iteration. Every Step
-// re-runs all installed programs and rebuilds the leading user message
-// from their output; assistant/tool history from prior Steps is preserved
-// only while the model is mid tool-using cycle (StopToolUse). When the
-// pre-selection hash of program outputs matches the previous substantive
-// iteration's hash (and we are not mid-cycle), the Step idles with
-// exponential backoff rather than re-querying the model. The agent never
-// auto-terminates — done is always false on success.
+// loadSystemPrompts composes the two mode-specific system prompts from
+// assets/system/identity.sh plus the mode-specific add-on (work.sh /
+// modeling.sh). Each asset is a script the harness executes once at
+// startup; the resulting strings stay byte-stable thereafter so the
+// system-slot cache breakpoint hits repeatedly. Missing assets are
+// tolerated (yields an empty prompt) so test harnesses that don't extract
+// the asset tree can still drive Step without setup.
+func (a *Agent) loadSystemPrompts() error {
+	sysDir := filepath.Join(a.root, "system")
+	identity, err := runSystemScript(filepath.Join(sysDir, "identity.sh"))
+	if err != nil {
+		return fmt.Errorf("loading system/identity.sh: %w", err)
+	}
+	work, err := runSystemScript(filepath.Join(sysDir, "work.sh"))
+	if err != nil {
+		return fmt.Errorf("loading system/work.sh: %w", err)
+	}
+	modeling, err := runSystemScript(filepath.Join(sysDir, "modeling.sh"))
+	if err != nil {
+		return fmt.Errorf("loading system/modeling.sh: %w", err)
+	}
+	a.workSystemPrompt = joinPromptParts(identity, work)
+	a.modelingSystemPrompt = joinPromptParts(identity, modeling)
+	return nil
+}
+
+func runSystemScript(path string) (string, error) {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	cmd := exec.Command(path)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(out), "\n"), nil
+}
+
+func joinPromptParts(a, b string) string {
+	switch {
+	case a == "" && b == "":
+		return ""
+	case a == "":
+		return b
+	case b == "":
+		return a
+	}
+	return a + "\n\n" + b
+}
+
+// programsDirEmpty reports whether the programs/ directory contains no
+// regular files. A missing directory counts as empty so a fresh init
+// without the cornerstone naturally triggers the bootstrap modeling turn.
+func (a *Agent) programsDirEmpty() (bool, error) {
+	entries, err := os.ReadDir(a.programsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+// libraryHash digests the program library (file names + contents) and the
+// .autoprobe/inactive file. Used to detect no-op modeling turns: if a
+// modeling turn closes with the same hash it started with, the harness
+// suppresses the next firing on the same stale signal. Best-effort —
+// individual read errors silently contribute nothing.
+func (a *Agent) libraryHash() [sha256.Size]byte {
+	h := sha256.New()
+	entries, err := os.ReadDir(a.programsDir)
+	if err == nil {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if !e.IsDir() {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			h.Write([]byte(name))
+			h.Write([]byte{0})
+			if data, err := os.ReadFile(filepath.Join(a.programsDir, name)); err == nil {
+				h.Write(data)
+			}
+			h.Write([]byte{0})
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(a.root, inactiveFileName)); err == nil {
+		h.Write([]byte("inactive\x00"))
+		h.Write(data)
+	}
+	var out [sha256.Size]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// Step runs a single inference + tool execution iteration. Branches by
+// currentTurnKind: work turns pursue the user's goal and may idle when the
+// environment is unchanged; modeling turns sit between work cycles and
+// update the program library based on what the last cycle revealed. The
+// agent never auto-terminates on a work turn unless the -n cap has been
+// reached; modeling turns close themselves when the model stops calling
+// tools or the in-turn step cap is exceeded.
 func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, error) {
+	if a.CurrentTurnKind() == TurnModeling {
+		return a.stepModeling(ctx)
+	}
+	return a.stepWork(ctx)
+}
+
+// stepWork runs a single work-mode inference. Re-runs all installed
+// programs, rebuilds the leading user message, preserves assistant/tool
+// history while mid-cycle (StopToolUse), and idles with exponential backoff
+// when the environment is unchanged. At cycle close, evaluates the modeling
+// cadence predicate and may flip currentTurnKind to TurnModeling for the
+// next Step.
+func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, error) {
 	var (
 		data            iterationData
 		userMsg         provider.UserMessage
@@ -358,12 +617,7 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		}
 
 		showPrompt = a.advanceOverflowStreak(fresh.overflowed(a.contextBudget))
-		// The wrap-up turn force-shows the distill prompt in the user
-		// message (no tool result is available to attach to — the cycle
-		// just ended). Periodic firings inside a tool-use cycle land in
-		// the last tool result instead, so this is the only path that
-		// uses the user-message slot.
-		userMsg = a.assembleUserMessage(fresh, showPrompt, a.finalPhase)
+		userMsg = a.assembleUserMessage(fresh, showPrompt, false)
 		a.conversation = append([]provider.Message{userMsg}, history...)
 		a.idleBackoff = 0
 		a.idlePollsInFlight.Store(0)
@@ -371,9 +625,6 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		data = fresh
 		a.lastProgramTokens.Store(int64(fresh.totalTokens))
 		a.refreshSnapshot(fresh, userMsg)
-		if a.finalPhase {
-			a.distillFiredAtNs.Store(time.Now().UnixNano())
-		}
 		break
 	}
 
@@ -384,8 +635,9 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 	// array grows.
 	contextMsgs := a.conversation
 	c := provider.Context{
-		Messages: contextMsgs,
-		Tools:    a.toolSchemas(),
+		SystemPrompt: a.workSystemPrompt,
+		Messages:     contextMsgs,
+		Tools:        a.toolSchemas(),
 	}
 	a.setPhase(PhaseInference)
 	msg, err := a.provider.Generate(ctx, "", c, provider.Options{MaxTokens: 8192})
@@ -454,54 +706,237 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		}
 	}
 
-	// Working-set alarm for periodic distillation. Inside a tool-use cycle,
-	// InputTokens − the program-output portion of the user message
-	// approximates how much prior history this inference is dragging
-	// forward. When that exceeds distillThresholdTokens on a single Step,
-	// append the distill prompt to the last tool result so the model sees
-	// it right before its next response. The cooldown then suppresses
-	// further firings — once history is large, every subsequent inference
-	// would re-cross the threshold and nag every turn. The cycle ending
-	// (msg.StopReason != StopToolUse) clears the cooldown because the
-	// history is about to be wiped.
-	distillFired := false
+	// In-cycle yield reinforcement. Inside a tool-use cycle, when drag
+	// crosses modelingThresholdTokens, append the yield prompt to the last
+	// tool result so the model sees it right before its next response. The
+	// cooldown then suppresses further firings — once history is large,
+	// every subsequent inference would re-cross the threshold and nag
+	// every turn. The cycle ending (msg.StopReason != StopToolUse) clears
+	// the cooldown because the history is about to be wiped. The
+	// reinforcement now only nudges the model to close the cycle — the
+	// library updates happen in the dedicated modeling turn that follows.
+	yieldFired := false
 	if msg.StopReason == provider.StopToolUse {
-		if a.distillCooldown > 0 {
-			a.distillCooldown--
+		if a.modelingCooldown > 0 {
+			a.modelingCooldown--
 		} else {
 			drag := msg.Usage.InputTokens - data.totalTokens
-			if drag >= distillThresholdTokens && len(toolResults) > 0 {
-				if text := a.runReinforcementPrompt(distillReinforcementName); text != "" {
+			if drag >= modelingThresholdTokens && len(toolResults) > 0 {
+				if text := a.runReinforcementPrompt(modelingReinforcementName); text != "" {
 					last := &toolResults[len(toolResults)-1]
 					last.Content = append(last.Content, provider.TextContent{Text: text})
-					distillFired = true
-					a.distillFiredAtNs.Store(time.Now().UnixNano())
+					yieldFired = true
+					a.yieldFiredThisCycle = true
+					a.modelingFiredAtNs.Store(time.Now().UnixNano())
 				}
-				a.distillCooldown = distillCooldownSteps
+				a.modelingCooldown = modelingCooldownSteps
 			}
 		}
 	} else {
-		a.distillCooldown = 0
+		a.modelingCooldown = 0
 	}
 
 	for _, tr := range toolResults {
 		a.conversation = append(a.conversation, tr)
 	}
 
-	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt, distillFired || a.finalPhase)
+	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt, yieldFired, TurnWork)
 
-	// Terminate once the wrap-up turn (and any tool cycle it kicked off) has
-	// fully resolved. The wrap-up turn itself runs on the Step *after* we
-	// hit -n: this turn ends the cycle and arms finalPhase, the next Step
-	// sees finalPhase=true and forces a distill firing, and the Step after
-	// that returns done=true once the model stops calling tools.
+	// Work-cycle close: evaluate cadence and possibly flip to modeling.
+	// Termination semantics: the agent terminates after the wrap-up
+	// modeling turn closes; the work cycle that hits -n schedules that
+	// modeling turn rather than running a wrap-up work step.
 	done := false
-	if a.finalPhase {
-		done = msg.StopReason != provider.StopToolUse
-	} else if a.reachedMaxIterations() && msg.StopReason != provider.StopToolUse {
-		a.finalPhase = true
+	cycleClosed := msg.StopReason != provider.StopToolUse
+	if cycleClosed {
+		if !a.finalPhase && a.reachedMaxIterations() {
+			a.finalPhase = true
+		}
+		a.maybeScheduleModelingTurn(prevStopReason)
+		// If no modeling turn was scheduled but we just closed the wrap-up
+		// cycle, the run terminates here.
+		if a.CurrentTurnKind() == TurnWork && a.finalPhase {
+			done = true
+		}
 	}
 	return msg, done, nil
+}
+
+// stepModeling runs a single inference inside the current modeling turn.
+// Modeling steps do not advance a.iteration, do not engage idle backoff,
+// and use the modeling system prompt. The first step of a modeling turn
+// builds the kickoff user message (program outputs + prior cycle transcript
+// + guidance); subsequent steps preserve assistant/tool history exactly
+// like a work cycle would. When the model stops calling tools (or the
+// in-turn step cap is hit), the modeling turn closes: currentTurnKind flips
+// back to TurnWork, no-op suppression is evaluated, and on the final-phase
+// path done=true is returned.
+func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bool, error) {
+	// The turn-kind axis (work vs. modeling) is surfaced via
+	// CurrentTurnKind; the phase axis still tracks the step's sub-stage
+	// (RunPrograms → Inference → Tools), set below.
+	var history []provider.Message
+	// History preservation inside the modeling turn mirrors the work cycle:
+	// while the model is mid tool-using (StopToolUse), keep its prior
+	// assistant + tool-result messages so it can continue from where it left
+	// off. On the first step of the modeling turn (modelingStepsThisTurn==0)
+	// we ignore lastStopReason entirely — it carries state from the prior
+	// work cycle that does not apply here.
+	if a.modelingStepsThisTurn > 0 && a.lastStopReason == provider.StopToolUse && len(a.conversation) > 1 {
+		history = append(history, a.conversation[1:]...)
+	}
+
+	a.setPhase(PhaseRunPrograms)
+	data, err := a.runIteration(ctx)
+	if err != nil {
+		return provider.AssistantMessage{}, false, err
+	}
+	a.totalIterations++
+
+	var userMsg provider.UserMessage
+	if a.modelingStepsThisTurn == 0 {
+		// First step of the modeling turn: build the kickoff user message
+		// with program outputs, prior cycle transcript, and guidance.
+		final := a.finalPhase
+		userMsg = a.assembleModelingUserMessage(data, a.workCycleTranscript, a.needsBootstrap, final)
+	} else {
+		// Subsequent steps: refresh the program outputs at the head, drop
+		// the transcript/guidance (the model has seen them). Just emit the
+		// fresh program-output region — modeling guidance is implicit at
+		// this point.
+		userMsg = a.assembleUserMessage(data, false, false)
+	}
+	a.conversation = append([]provider.Message{userMsg}, history...)
+	a.lastProgramTokens.Store(int64(data.totalTokens))
+	a.refreshSnapshot(data, userMsg)
+
+	iterStartedAt := time.Now()
+	contextMsgs := a.conversation
+	c := provider.Context{
+		SystemPrompt: a.modelingSystemPrompt,
+		Messages:     contextMsgs,
+		Tools:        a.toolSchemas(),
+	}
+	a.setPhase(PhaseInference)
+	msg, err := a.provider.Generate(ctx, "", c, provider.Options{MaxTokens: 8192})
+	if err != nil {
+		return provider.AssistantMessage{}, false, err
+	}
+	a.totalInputTokens.Add(int64(msg.Usage.InputTokens))
+	a.totalOutputTokens.Add(int64(msg.Usage.OutputTokens))
+	if msg.StopReason == provider.StopError {
+		return msg, false, fmt.Errorf("provider error: %s", msg.Err)
+	}
+	if msg.StopReason == provider.StopMaxTokens {
+		if n := len(msg.Content); n > 0 {
+			if _, ok := msg.Content[n-1].(provider.ToolCall); ok {
+				msg.Content = msg.Content[:n-1]
+			}
+		}
+		if hasToolCall(msg.Content) {
+			msg.StopReason = provider.StopToolUse
+		}
+	}
+	// Skip stats updates on modeling turns: their assistant text is about
+	// library curation, not about responding to program outputs, so
+	// overlap-with-response would be noise.
+
+	a.lastStopReason = msg.StopReason
+	a.conversation = append(a.conversation, msg)
+	a.modelingStepsThisTurn++
+
+	var toolResults []provider.ToolResultMessage
+	if hasToolCall(msg.Content) {
+		a.setPhase(PhaseTools)
+	}
+	for _, c := range msg.Content {
+		if call, ok := c.(provider.ToolCall); ok {
+			toolResults = append(toolResults, a.executeTool(call))
+		}
+	}
+	for _, tr := range toolResults {
+		a.conversation = append(a.conversation, tr)
+	}
+
+	a.writeTrace(iterStartedAt, time.Now(), 0, 0, contextMsgs, msg, toolResults, data, userMsg, false, false, TurnModeling)
+
+	// Modeling-turn close: when the model stops calling tools or the
+	// in-turn step cap is exceeded, evaluate no-op suppression, clear
+	// modeling state, and flip back to work mode. If finalPhase is set
+	// (this was the wrap-up modeling turn), terminate.
+	turnClosed := msg.StopReason != provider.StopToolUse || a.modelingStepsThisTurn >= modelingTurnStepCap
+	if turnClosed {
+		postHash := a.libraryHash()
+		a.modelingNoOpSuppressed = postHash == a.preModelingLibraryHash
+		a.currentTurnKind.Store(uint32(TurnWork))
+		a.modelingStepsThisTurn = 0
+		a.workCycleTranscript = nil
+		a.needsBootstrap = false
+		a.workCyclesSinceModeling = 0
+		// Force the next work step to run a fresh inference rather than
+		// idle on a stale hash — the modeling turn likely changed the
+		// program library, so the next dashboard is materially different.
+		a.lastOutputHash = programHash{}
+		a.lastStopReason = provider.StopEnd
+		if a.finalPhase {
+			return msg, true, nil
+		}
+	}
+	return msg, false, nil
+}
+
+// maybeScheduleModelingTurn evaluates the cadence predicate at a work cycle
+// close and flips currentTurnKind to TurnModeling when one of the triggers
+// fires. Triggers (any):
+//   - default: the in-cycle yield reinforcement fired during this cycle.
+//   - forced: the wrap-up turn after -n was exhausted.
+//   - periodic safety net: this many consecutive work cycles closed with
+//     no other trigger.
+// Skipped when the closed work cycle did no tool calls (idle cycle — nothing
+// to model) and when the previous modeling turn was a no-op without a fresh
+// trigger condition firing.
+func (a *Agent) maybeScheduleModelingTurn(prevStopReason provider.StopReason) {
+	defaultTrigger := a.yieldFiredThisCycle
+	forcedTrigger := a.finalPhase
+	a.workCyclesSinceModeling++
+	periodicTrigger := a.workCyclesSinceModeling >= modelingPeriodicWorkCycles
+
+	// A cycle that did no tool calls (the agent idled or returned text
+	// without invoking any tool) does not produce a modeling turn: nothing
+	// happened that could have moved the model. We detect this by checking
+	// whether the just-closed cycle was a one-step StopEnd (prev was not
+	// StopToolUse), which means no tools were ever invoked in that cycle.
+	noToolCycle := prevStopReason != provider.StopToolUse
+	if noToolCycle && !forcedTrigger {
+		a.yieldFiredThisCycle = false
+		return
+	}
+
+	freshTrigger := defaultTrigger || forcedTrigger || periodicTrigger
+	if !freshTrigger {
+		a.yieldFiredThisCycle = false
+		return
+	}
+	// No-op suppression: if the previous modeling turn produced no library
+	// changes, we suppress the next firing UNTIL a fresh trigger condition
+	// distinct from the one that led to the no-op. Forced and periodic
+	// triggers always fire (they are not the "stale" signal); only the
+	// default (yield) trigger can be suppressed by the prior no-op.
+	if a.modelingNoOpSuppressed && defaultTrigger && !forcedTrigger && !periodicTrigger {
+		a.yieldFiredThisCycle = false
+		return
+	}
+
+	a.currentTurnKind.Store(uint32(TurnModeling))
+	transcript := make([]provider.Message, 0, len(a.conversation))
+	if len(a.conversation) > 1 {
+		transcript = append(transcript, a.conversation[1:]...)
+	}
+	a.workCycleTranscript = transcript
+	a.preModelingLibraryHash = a.libraryHash()
+	a.workCyclesSinceModeling = 0
+	a.yieldFiredThisCycle = false
+	a.modelingFiredAtNs.Store(time.Now().UnixNano())
 }
 
 // writeTrace assembles this iteration's trace record and hands it to the
@@ -518,14 +953,18 @@ func (a *Agent) writeTrace(
 	data iterationData,
 	userMsg provider.UserMessage,
 	revisionFired bool,
-	distillFired bool,
+	yieldFired bool,
+	kind TurnKind,
 ) {
 	if a.tracer == nil {
 		return
 	}
+	a.traceSeq++
 	activeBudget := a.contextBudget * activeBudgetPercent / 100
 	rec := IterationTrace{
-		Iteration:       a.iteration,
+		Iteration:       a.traceSeq,
+		WorkIteration:   a.iteration,
+		TurnKind:        kind.String(),
 		StartedAt:       started,
 		CompletedAt:     completed,
 		IdlePollsBefore: idlePolls,
@@ -544,7 +983,7 @@ func (a *Agent) writeTrace(
 			UsedTokens:              data.totalTokens,
 			Overflowed:              data.overflowed(a.contextBudget),
 			RevisionPromptFired:     revisionFired,
-			DistillPromptFired:      distillFired,
+			ModelingPromptFired:     yieldFired,
 			ActiveBudgetTokens:      activeBudget,
 			ExplorationBudgetTokens: a.contextBudget - activeBudget,
 		},
@@ -960,7 +1399,88 @@ func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, erro
 	if err != nil {
 		return nil, err
 	}
+	if a.CurrentTurnKind() == TurnModeling {
+		return []provider.Message{a.assembleModelingUserMessage(data, nil, a.needsBootstrap, false)}, nil
+	}
 	return []provider.Message{a.assembleUserMessage(data, false, false)}, nil
+}
+
+// assembleModelingUserMessage builds the user message that kicks off a
+// modeling turn. Three parts in order:
+//   1. The same assembled program-output context the just-closed work cycle
+//      saw (packed with the same lex-order / 80-20 logic so the byte-stable
+//      region cache hit carries over from the work cycle's last request).
+//   2. The prior work cycle's transcript serialized to text — flattened from
+//      provider.Message records so we don't have to round-trip provider-
+//      native signatures (Anthropic thinking, OpenAI reasoning, Google
+//      thought) under a different system prompt where they may not validate.
+//   3. A short guidance block (bootstrap / final / default framing).
+//
+// transcript may be nil (bootstrap firing — there is no prior cycle to
+// review). When bootstrap is set, the program-output region is also empty
+// in practice because the library is empty.
+func (a *Agent) assembleModelingUserMessage(d iterationData, transcript []provider.Message, bootstrap, final bool) provider.UserMessage {
+	work := a.assembleUserMessage(d, false, false)
+	contents := work.Content
+	if len(transcript) > 0 {
+		var b strings.Builder
+		b.WriteString("[PRIOR WORK CYCLE TRANSCRIPT]\n")
+		serializeTranscriptText(&b, transcript)
+		contents = append(contents, provider.TextContent{Text: b.String()})
+	}
+	guidance := modelingGuidance
+	switch {
+	case bootstrap:
+		guidance = modelingBootstrapGuidance
+	case final:
+		guidance = modelingFinalGuidance
+	}
+	contents = append(contents, provider.TextContent{Text: guidance})
+	return provider.UserMessage{Content: contents}
+}
+
+// serializeTranscriptText writes each prior-cycle message to b in a compact
+// human-readable form. Assistant text/thinking content is rendered with role
+// markers, tool calls are summarized as "[tool=NAME args=...]", and tool
+// results carry their ToolName / IsError flag inline. Lossy compared to the
+// structured form but adequate for the modeling turn's review pass.
+func serializeTranscriptText(b *strings.Builder, msgs []provider.Message) {
+	for _, m := range msgs {
+		switch m := m.(type) {
+		case provider.AssistantMessage:
+			b.WriteString("\n--- assistant ---\n")
+			for _, c := range m.Content {
+				switch c := c.(type) {
+				case provider.TextContent:
+					b.WriteString(c.Text)
+					b.WriteByte('\n')
+				case provider.ThinkingContent:
+					if c.Thinking != "" {
+						b.WriteString("(thinking) ")
+						b.WriteString(c.Thinking)
+						b.WriteByte('\n')
+					}
+				case provider.ToolCall:
+					b.WriteString("[tool=")
+					b.WriteString(c.Name)
+					if len(c.Arguments) > 0 {
+						b.WriteString(" args=")
+						b.Write(c.Arguments)
+					}
+					b.WriteString("]\n")
+				}
+			}
+		case provider.ToolResultMessage:
+			b.WriteString("\n--- tool result: ")
+			b.WriteString(m.ToolName)
+			if m.IsError {
+				b.WriteString(" (error)")
+			}
+			b.WriteString(" ---\n")
+			b.WriteString(provider.JoinText(m.Content))
+			b.WriteByte('\n')
+		}
+	}
 }
 
 // iterationData bundles one iteration's worth of program execution: the
@@ -1037,10 +1557,10 @@ func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt, finalPh
 			contents = append(contents, provider.TextContent{Text: text})
 		}
 	}
-	// Wrap-up turn forces a distill firing in the user message — there is no
+	// Wrap-up turn forces a modeling firing in the user message — there is no
 	// tool result to attach to because the cycle just ended.
 	if finalPhase {
-		if text := a.runReinforcementPrompt(distillReinforcementName, "AUTOPROBE_FINAL=1"); text != "" {
+		if text := a.runReinforcementPrompt(modelingReinforcementName, "AUTOPROBE_FINAL=1"); text != "" {
 			contents = append(contents, provider.TextContent{Text: text})
 		}
 	}
