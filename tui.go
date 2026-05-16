@@ -12,21 +12,10 @@ import (
 	"github.com/comnik/autoprobe/internal/provider"
 )
 
-const (
-	// maxLineLength caps the rendered dashboard width. Wider than this is
-	// wasted screen real estate — the panels are dense but narrow.
-	maxLineLength = 92
-
-	// Lines reserved for the assistant-message panel. Holds even when the
-	// message would be longer (trailing lines are truncated with an
-	// ellipsis) so the dashboard height stays constant.
-	assistantPanelLines = 8
-
-	// How long a transient visual flash (DISTILL badge, library "changed"
-	// pulse) holds after the triggering event before fading back to the
-	// resting style.
-	flashDuration = 2 * time.Second
-)
+// How long a transient visual flash (DISTILL badge, library "changed"
+// pulse) holds after the triggering event before fading back to the
+// resting style.
+const flashDuration = 2 * time.Second
 
 type tuiState int
 
@@ -113,7 +102,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ready = true
-		return m, nil
+		// Wipe any stale cells the standard renderer would otherwise
+		// leave behind when the new render's line count shrinks (the
+		// dashboard's height varies with assistant-message wrap).
+		return m, tea.ClearScreen
 
 	case primedMsg:
 		if msg.err != nil {
@@ -157,9 +149,6 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m tuiModel) contentWidth() int {
 	w := m.width
-	if w > maxLineLength {
-		w = maxLineLength
-	}
 	if w < 20 {
 		w = 20
 	}
@@ -181,8 +170,6 @@ func (m tuiModel) View() string {
 		bars,
 		strings.Repeat("─", cw),
 		m.renderAssistant(cw),
-		strings.Repeat("─", cw),
-		m.renderFooter(cw),
 	}
 	return strings.Join(sections, "\n")
 }
@@ -220,7 +207,8 @@ var (
 	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
 	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	errStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
+	errBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("203"))
 	footerKey    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 	footerLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	asstStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
@@ -248,17 +236,22 @@ var (
 func (m tuiModel) renderHeader(width int) string {
 	title := titleStyle.Render("autoprobe v" + Version)
 	model := m.agent.Provider().DefaultModel()
-	cycles := m.agent.ToolCycles()
 	idle := ""
 	if polls, since, active := m.agent.IdleStatus(); active {
-		idle = fmt.Sprintf("  idle: %d polls, %s", polls, since.Truncate(time.Second))
+		idle = fmt.Sprintf("   idle: %d polls, %s", polls, since.Truncate(time.Second))
 	}
-	right := infoStyle.Render(fmt.Sprintf("model: %s   cycles: %d%s", model, cycles, idle))
-	line := title + "   " + right
-	if m.state == stateError && m.err != nil {
-		return line + "\n" + errStyle.Render("error: "+m.err.Error())
+	left := title + "   " + infoStyle.Render(model+idle)
+	right := footerKey.Render("q") + footerLabel.Render(" quit")
+	if m.state == stateDone {
+		right = footerKey.Render("enter") + footerLabel.Render(" exit")
+	} else if m.state == stateError {
+		right = footerKey.Render("enter") + footerLabel.Render(" exit")
 	}
-	return line
+	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if pad < 1 {
+		pad = 1
+	}
+	return left + strings.Repeat(" ", pad) + right
 }
 
 func (m tuiModel) renderPhase(width int) string {
@@ -283,7 +276,13 @@ func (m tuiModel) renderPhase(width int) string {
 		}
 		parts = append(parts, style.Render(mark)+" "+pipLabel.Render(p.label))
 	}
-	return strings.Join(parts, "   ")
+	left := strings.Join(parts, "   ")
+	right := infoStyle.Render(fmt.Sprintf("cycles: %d", m.agent.ToolCycles()))
+	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if pad < 1 {
+		pad = 1
+	}
+	return left + strings.Repeat(" ", pad) + right
 }
 
 func (m tuiModel) renderTokens(width int) string {
@@ -546,26 +545,16 @@ func countChanged(snap []ProgramSnapshot) int {
 }
 
 func (m tuiModel) renderAssistant(width int) string {
+	if m.state == stateError && m.err != nil {
+		banner := errBannerStyle.Render(" ERROR ")
+		body := errStyle.Width(width).Render(m.err.Error())
+		return banner + "\n\n" + body
+	}
 	text := latestAssistantText(m.agent.Conversation())
 	if text == "" {
-		return mutedStyle.Width(width).Height(assistantPanelLines).Render("(waiting for first response)")
+		return mutedStyle.Render("(waiting for first response)")
 	}
-	wrapped := asstStyle.Width(width).Render(text)
-	lines := strings.Split(wrapped, "\n")
-	if len(lines) > assistantPanelLines {
-		lines = lines[:assistantPanelLines]
-		// Mark truncation on the last visible line.
-		last := lines[assistantPanelLines-1]
-		if lipgloss.Width(last) > 1 {
-			lines[assistantPanelLines-1] = last + mutedStyle.Render(" …")
-		} else {
-			lines[assistantPanelLines-1] = mutedStyle.Render("…")
-		}
-	}
-	for len(lines) < assistantPanelLines {
-		lines = append(lines, "")
-	}
-	return strings.Join(lines, "\n")
+	return asstStyle.Width(width).Render(text)
 }
 
 func latestAssistantText(conversation []provider.Message) string {
@@ -583,26 +572,6 @@ func latestAssistantText(conversation []provider.Message) string {
 	return ""
 }
 
-func (m tuiModel) renderFooter(width int) string {
-	state := ""
-	switch m.state {
-	case stateInit:
-		state = "priming…"
-	case stateRunning:
-		state = "running"
-	case stateDone:
-		state = "done — press enter to exit"
-	case stateError:
-		state = "error — press enter to exit"
-	}
-	left := footerKey.Render("q") + footerLabel.Render(" quit")
-	right := footerLabel.Render(state)
-	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
-	if pad < 1 {
-		pad = 1
-	}
-	return left + strings.Repeat(" ", pad) + right
-}
 
 func humanInt(n int) string {
 	if n < 0 {
