@@ -54,21 +54,26 @@ prompt and a different user message.
 
 The modeling turn's framing:
 
-- **System prompt.** "You are not solving the user's task right now. The
-  previous work cycle's assistant messages and tool results are below for
-  context. Your only job is to update the library so it remains an accurate
-  executable model of the environment — incorporating anything the last cycle
-  revealed, removing anything that has drifted out of date. When you are
-  done, respond with no tool calls."
-- **User message.** Includes
-  - the same probe-output context the work cycle saw, so the agent sees the
-    current dashboard;
-  - a transcript of the work cycle's assistant turns and tool results, so
-    the agent can see what it just did;
-  - guidance on what to look for (repeated reads, repeated bash commands,
-    verbose outputs that should be compressed, dead programs to remove —
-    much of the substance that today's `modeling/general.sh` reinforcement
-    inlines into the work cycle).
+- **System prompt.** Composed from `assets/system/identity.sh` plus
+  `assets/system/modeling.sh` — see [Splitting the cornerstone into
+  system-prompt assets](#splitting-the-cornerstone-into-system-prompt-assets)
+  below. The mode-specific portion says, in effect: "You are not solving
+  the user's task right now. The previous work cycle's assistant messages
+  and tool results are below for context. Your only job is to update the
+  library so it remains an accurate executable model of the environment —
+  incorporating anything the last cycle revealed, removing anything that
+  has drifted out of date. When you are done, respond with no tool calls."
+- **User message.** Three parts, in order:
+  1. The same assembled program-output context the just-closed work cycle
+     saw (probes packed in lex order, the byte-stable region from
+     [context-budget.md](context-budget.md)).
+  2. The full transcript of the just-closed work cycle's assistant turns
+     and tool results — the same messages the work cycle accumulated, in
+     order. First version passes the transcript verbatim; filtering or
+     summarizing is deferred until we measure whether it's worth it.
+  3. A short guidance block (repeated reads, repeated bash commands,
+     verbose outputs that should be compressed, dead programs to remove)
+     appended after the transcript.
 
 The modeling turn uses the same tool surface (`read`, `bash`, `edit`, `write`)
 and runs the same way as a work cycle from the harness's perspective —
@@ -76,26 +81,160 @@ multiple tool-use turns until the model emits a response with no tool calls.
 The only differences are the system prompt, the user message, and that the
 turn does not count toward the configured iteration budget (`-n`).
 
+### Splitting the cornerstone into system-prompt assets
+
+Today autoprobe has no formal system prompt: the `aaa-cornerstone` program
+emits identity/framing text into the user-message slot every iteration.
+That conflates two things — *who the agent is* (stable across iterations
+and across modes) and *what's currently in the environment* (the probe
+outputs that follow). It also wastes prompt-cache potential, because the
+identity text sits below the user-message position where the byte-stable
+region ends.
+
+With a dedicated modeling turn, autoprobe now needs two system prompts
+(one per mode), so this is the moment to formalize the system slot
+properly. The cornerstone is split into mode-aware assets under a new
+`assets/system/` directory:
+
+```
+assets/system/
+├── identity.sh   # shared — who the agent is, tool usage prose,
+│                 #   exit codes as status channel, lex-order attention,
+│                 #   $AUTOPROBE_PROGRAMS_DIR is your persistent memory.
+├── work.sh       # work-mode add-on — pursue the user goal *via*
+│                 #   keeping the library an accurate model.
+└── modeling.sh   # modeling-mode add-on — review the prior cycle,
+                  #   update the library accordingly.
+```
+
+The harness composes the per-mode system prompt at startup: work mode is
+`identity + work`, modeling mode is `identity + modeling`. Both render to
+strings that go into the provider's system slot, which is exactly where
+breakpoint 2 lives in the [Prompt caching](#prompt-caching) layout —
+identity material gets the deepest cache hits, mode add-ons cache
+per-mode without interfering.
+
+Tools usage prose (the "Available tools" list and the "Guidelines"
+block from the current cornerstone) lives in `identity.sh`, not a
+separate file. Keeping it bundled there avoids a third asset for one
+small section and matches how a reader actually wants to consume the
+prompt — identity, then how-to-use-tools, then mode-specific framing.
+Note that this is *prose about tool usage*, distinct from the JSON tool
+schemas which already live in `tools.go` and are passed via the
+provider's `tools` parameter (breakpoint 1).
+
+The trailing transition sentence in today's cornerstone — *"Here are the
+current outputs from active programs in the $AUTOPROBE_PROGRAMS_DIR
+directory…"* — has no home in the new structure. It was a hand-off
+between the cornerstone's identity text and the program outputs in the
+same user message. With identity moved into the system slot, the program
+outputs are simply the user message; they don't need an introductory
+sentence. Drop it.
+
+After this split, `assets/programs/aaa-cornerstone` is deleted. Nothing
+remains for it to emit, and the `aaa-` attention slot in the program-
+output region opens up for the agent's own high-priority probes.
+
 ### Cadence
 
 A modeling turn runs between work cycles, not on every work cycle. Always-on
 modeling would double the inference cost without much marginal benefit for
-cycles where the agent did little or nothing novel. The harness decides when
-to fire one based on a coarse trigger:
+cycles where the agent did little or nothing novel. The harness decides
+when to fire one based on a small predicate:
 
-- **Default trigger.** A work cycle that consumed more than a configurable
-  in-cycle token budget (a similar threshold to the one
-  `modeling/general.sh` already uses).
-- **Forced trigger.** The wrap-up turn after `-n` is exhausted runs as a
-  modeling turn rather than appending the final-iteration reinforcement to
-  the next work cycle.
-- **Skip trigger.** A work cycle that did no tool calls (e.g., the agent
-  idled because nothing changed) does not get a modeling turn — nothing
-  happened that could have moved the model.
+- **Bootstrap trigger.** At the start of a run, if `programs/` is empty
+  (or contains only the inline `--goal` probe), the harness runs a
+  modeling turn *before* the first work iteration. The cornerstone used
+  to seed the library implicitly; now that the cornerstone is gone, an
+  empty library means the agent has no model to start from, and a
+  bootstrap modeling turn is the right way to install one. See
+  [Bootstrap modeling turn](#bootstrap-modeling-turn) below for how its
+  framing differs from the regular case.
+- **Default trigger.** The in-cycle yield reinforcement (see [The in-cycle
+  reinforcement becomes yield-only](#the-in-cycle-reinforcement-becomes-yield-only)
+  below) fired at least once during the just-closed work cycle. That
+  condition already means "the cycle accumulated enough in-cycle drag that
+  it was worth yielding," which is the same signal we want for "there is
+  likely something worth modeling." Reuses the existing
+  `modelingThresholdTokens` (32K) and the `modelingFired` flag the harness
+  already tracks.
+- **Forced trigger.** `-n` exhausted. The wrap-up runs as a modeling turn
+  rather than appending a final-iteration reinforcement to a next work
+  cycle that will never happen.
+- **Periodic safety net.** If neither of the above has fired for N work
+  cycles in a row (default: 10), force a modeling turn anyway, so
+  long-running quiet phases still get curated.
+- **Skip trigger.** A work cycle that did no tool calls (the agent idled,
+  or returned text without invoking any tool) does not get a modeling
+  turn — nothing happened that could have moved the model.
 
-A simple counter — "iterations since last modeling turn" — can also force a
-modeling turn periodically if the in-cycle threshold has not been hit in a
-while, to ensure long-running quiet cycles still get curated.
+#### Bootstrap modeling turn
+
+The bootstrap firing is structurally identical to a regular modeling
+turn — same system prompt, same harness machinery, same tool surface —
+but the user message differs in two ways because there is no prior work
+cycle to look at:
+
+1. No work-cycle transcript section. The agent has nothing to review.
+2. The guidance block names the situation: *"The library is empty (or
+   contains only a goal probe). Install initial programs that model the
+   parts of the environment relevant to the goal — what's in the
+   repository, what builds, what passes, what's broken — so the first
+   work iteration starts from a real dashboard rather than a blank
+   one."*
+
+The bootstrap firing is gated by an env var (`AUTOPROBE_BOOTSTRAP=1`)
+passed to the script that emits the guidance, mirroring how
+`AUTOPROBE_FINAL` switches the existing reinforcement to last-chance
+framing today.
+
+A bootstrap modeling turn that produces no library mutations is a
+warning sign — the agent declined to install anything despite an empty
+library — but the harness still proceeds to the first work cycle. The
+work cycle will run with a sparse dashboard; the agent has the option
+to install probes mid-cycle if it wants to. Subsequent modeling turns
+will fire under the regular triggers.
+
+#### No-op suppression
+
+If a modeling turn closes without writing to `programs/` or `inactive`, it
+produced nothing of value. The harness suppresses the next modeling turn
+until something in the work loop justifies one again — specifically, until
+the in-cycle yield reinforcement fires again, or `-n` is exhausted, or the
+periodic safety-net counter elapses. Without this, every threshold-
+crossing work cycle would trigger an empty modeling turn, training the
+agent to phone in the work (and burning inference on nothing).
+
+The suppression is per-trigger, not global: a no-op modeling turn doesn't
+disable future modeling, it just gates the next one on a *fresh* signal
+rather than the stale "this cycle dragged" signal that already led to the
+no-op.
+
+### The in-cycle reinforcement becomes yield-only
+
+The existing `assets/reinforcement/modeling/general.sh` does two jobs
+today: it asks the agent to (a) write a probe capturing what was just
+learned, and (b) end the tool-use cycle. With a dedicated modeling turn
+taking over (a) properly, the in-cycle reinforcement collapses to (b)
+alone: a yield nudge.
+
+Rewriting the script's body removes the "compress" language and keeps
+only the close-the-cycle framing — something like: *"You have accumulated
+significant in-cycle drag. Respond with a brief plain-text summary and
+NO further tool calls. A modeling turn will run next and update the
+library based on what just happened."*
+
+The trigger plumbing stays as it is — same threshold, same cooldown,
+same `modelingFired` flag — because the trigger is also what tells the
+modeling-turn cadence (above) that a modeling turn should fire. The
+content change is one shell script and nothing else.
+
+Once we have measured the effect of the modeling turn, a follow-up rename
+of the in-cycle thing (directory `assets/reinforcement/modeling/` →
+`yield/`, constant `modelingReinforcementName` → `yieldReinforcementName`,
+field `modelingFired` → `yieldFired`, etc.) makes the split between the
+two concerns clean at the code level too. Deferred so the diff for this
+design stays focused.
 
 ### What the modeling turn does *not* do
 
@@ -103,14 +242,57 @@ while, to ensure long-running quiet cycles still get curated.
   access to the full tool set and can still write to the library mid-flow
   if the agent chooses to — this is not a moratorium on in-cycle library
   edits, just an explicit place to do them with full attention.
-- It does not replace `modeling/general.sh`. That reinforcement still fires
-  inside the work cycle on the existing threshold to encourage yielding;
-  the new modeling turn is what happens *after* the yield. Over time, if
-  the dedicated turn proves effective, the in-cycle reinforcement can be
-  softened or removed.
 - It does not introduce a separate process or sub-agent. Same harness,
   same model, same library, same provider connection. Just an additional
   inference with a different prompt.
+- It does not run unconditionally. The cadence predicate above gates
+  firing; idle cycles and no-op modeling turns both back off rather than
+  spinning.
+
+### Implementation mechanics
+
+The modeling turn slots into the existing `Step`/`Run` structure in
+`agent.go` as a parallel inference path, not a parallel goroutine. After
+each work cycle closes (`lastStopReason != StopToolUse`), the cadence
+predicate is evaluated; if it fires, the harness runs a modeling turn
+before the next `runIteration` call.
+
+A modeling turn is itself a loop of `Step`-like inferences with a
+distinct `kind` flag threaded through, controlling:
+
+- which system prompt is used (work-mode cornerstone vs. modeling-mode
+  asset);
+- whether the iteration counter (`a.iteration`) advances — it does for
+  work iterations, it does not for modeling turns. `maxIterations` (`-n`)
+  is a budget over work iterations only;
+- which cache breakpoint set is applied (see [Prompt
+  caching](#prompt-caching) below);
+- which value is written into the trace's `turn_kind` field.
+
+The modeling turn has its own in-turn safety cap — a maximum number of
+inference steps inside one modeling turn (default: 8). Beyond that, the
+harness closes the modeling turn even if the model is still calling
+tools, logs the truncation, and proceeds to the next work cycle. This
+mirrors the work cycle's existing protections and prevents a runaway
+modeling turn from blocking forward progress.
+
+#### Failure handling
+
+If a modeling turn hits a provider error, exceeds its in-turn cap, or
+otherwise terminates abnormally:
+
+- Whatever library mutations the modeling turn *did* commit to disk stay
+  committed — `programs/` and `inactive` are persistent state and not
+  rolled back.
+- The trace records the failure on the modeling-turn iteration.
+- The next work cycle starts normally. Library state is whatever the
+  partial modeling turn left it as; the next work cycle's program
+  outputs reflect that.
+
+Failure modes are explicitly recoverable: the modeling turn can be
+incomplete without corrupting forward progress, because the library is
+the ground truth and a half-applied modeling turn just means the next
+modeling turn has more to do.
 
 ### Interaction with idle backoff
 
@@ -129,6 +311,29 @@ iteration, but tagged distinctly so operators reviewing
 and which were modeling. This also gives us a measurable signal — "what did
 the modeling turn change" — which is the natural success metric for this
 design.
+
+Concretely: `IterationTrace` and the `LogIteration` summary line gain a
+`TurnKind string` field with values `"work"` (default) or `"modeling"`.
+Existing traces without the field render as `"work"` for backward
+compatibility. The HTML renderer adds a small badge in the per-iteration
+header so operators can scan the iteration list and tell at a glance
+which turn was which.
+
+### Interaction with the TUI
+
+The dashboard's phase strip (see [tui.md](./tui.md)) gets a new phase
+value, `PhaseModeling`, that the agent sets while a modeling turn's
+inferences are running and clears when the turn closes. The strip
+shows it as a distinct state alongside `PhaseRunPrograms` /
+`PhaseInference` / `PhaseTools`.
+
+The existing `MODELING` flash on the drag bar is separate: it indicates
+that the in-cycle yield reinforcement fired inside the current work
+cycle, not that the dedicated turn is running. Both signals coexist —
+the flash is "the yield prompt just landed in a tool result," the
+phase indicator is "a modeling turn is currently executing." Keeping
+them visually distinct (a brief flash vs. a sustained phase) reads
+correctly to an operator watching the dashboard.
 
 ### Prompt caching
 
@@ -206,9 +411,9 @@ Four breakpoints, ordered by stability (most stable first):
   iteration counters in the system prompt. If we want those values
   visible to the agent, they belong inside a probe — i.e., in the
   user-message portion where churn is expected.
-- **Reinforcement placement.** The `[MODELING]` / `[REVISION]`
-  reinforcements today are appended to user-message content. They must
-  land *after* breakpoint 3 (the byte-stable program-output prefix),
+- **Reinforcement placement.** The in-cycle yield reinforcement and the
+  `[REVISION]` reinforcement are appended to user-message content. They
+  must land *after* breakpoint 3 (the byte-stable program-output prefix),
   not interspersed within it, so adding or removing a reinforcement
   doesn't invalidate the program-output cache.
 
@@ -247,20 +452,59 @@ It changes exactly one thing: it stops asking the agent to hold both goals
 within a single turn. The two goals are alternated *between* turns instead
 of held in tension *within* turns. Everything else follows from that.
 
+## Files touched by this design
+
+- `agent.go` — thread a `kind` parameter through `Step` (work vs.
+  modeling). Add the cadence predicate evaluated at cycle close
+  (in-cycle yield fired ∨ `-n` exhausted ∨ periodic counter elapsed,
+  minus no-op suppression). Add the bootstrap firing at run start when
+  the library is empty. Add `PhaseModeling` to the phase enum and
+  set/clear it around modeling-turn inferences. Don't advance
+  `a.iteration` on modeling-turn steps. Track the modeling-turn in-turn
+  step counter and cap (default 8). Track the no-op suppression flag
+  (cleared by any of the trigger conditions firing fresh). Wire two
+  system-prompt compositions (`identity + work`, `identity + modeling`)
+  into the provider call.
+- `trace.go` — add `TurnKind string` to `IterationTrace` and the
+  `LogIteration` summary line. Default `"work"` for backward compatibility.
+- `trace_render.go` / viewer assets — render the modeling badge in the
+  per-iteration header of the HTML trace.
+- `tui.go` — surface `PhaseModeling` in the phase strip alongside the
+  existing phase values. The drag-bar `MODELING` flash stays as-is — it
+  signals the in-cycle yield reinforcement, not the dedicated turn.
+- `assets/system/identity.sh` (new) — shared system-prompt asset: who
+  the agent is, tool usage prose, exit-code contract, lex-order attention
+  placement, `$AUTOPROBE_PROGRAMS_DIR` as persistent memory.
+- `assets/system/work.sh` (new) — work-mode add-on: pursue the user goal
+  via maintaining an accurate library model.
+- `assets/system/modeling.sh` (new) — modeling-mode add-on: review the
+  prior work cycle (or the empty starting state when `AUTOPROBE_BOOTSTRAP=1`)
+  and update the library accordingly.
+- `assets/programs/aaa-cornerstone` — **deleted.** Identity content moves
+  to `assets/system/identity.sh`; mode-specific framing moves into
+  `work.sh`/`modeling.sh`; trailing user-message transition sentence is
+  dropped.
+- `assets/reinforcement/modeling/general.sh` — rewrite body to yield-only
+  framing (drop the "compress" / "write a program" language; keep the
+  close-the-cycle framing).
+- `init_tui.go` / `config.go` — `autoprobe init` no longer ships the
+  cornerstone into `programs/`; `programs/` starts empty (or with the
+  inline `--goal` probe). The first run picks up the bootstrap trigger
+  naturally.
+- `docs/designs/dedicated-modeling-turn.md` — this document.
+
 ## Open questions
 
 - **How much context from the work cycle should the modeling turn see?**
-  Full transcript is most informative but expensive. A summary or a
-  filtered view (e.g., only tool calls + brief excerpts) may be enough.
-  Worth measuring empirically once the basic flow is in place.
-- **Modeling turn iteration budget.** The modeling turn itself can run
-  multiple tool-use turns (read a file, edit a probe, run it to verify,
-  etc.). Some upper bound is needed to prevent runaway. A simple
-  in-cycle token cap mirrors the work cycle's existing protections.
-- **Does the in-cycle `[MODELING]` reinforcement still earn its keep?**
-  If the dedicated modeling turn handles capture well, the in-cycle nudge
-  may become unnecessary or even counterproductive. Plan to measure
-  before/after and revisit.
+  First version passes the full transcript verbatim. Worth measuring
+  whether a summarized or filtered transcript performs as well at lower
+  token cost once the basic flow is in place.
+- **Periodic safety-net cadence.** Default of "force after 10 work cycles
+  with no other trigger" is a guess. Worth tuning once we have data on how
+  often the default trigger fires in practice.
+- **In-turn step cap for modeling turns.** Default 8 is a guess too —
+  enough for "read a file, write a probe, run it, fix it, write another"
+  but capped well short of runaway. Tune empirically.
 - **Should the modeling turn see the *next* work cycle's anticipated
   framing?** I.e., should it know what the user goal still is so it can
   prioritize what to capture? Probably yes — the goal probe is part of the
