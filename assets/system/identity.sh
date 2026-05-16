@@ -6,7 +6,14 @@
 # iteration counters) OUT of this file.
 set -eu
 
-cat <<'EOF'
+# Derive the absolute path to the programs directory from this script's own
+# location: assets/system/identity.sh lives at <probe-root>/system/identity.sh,
+# and the programs directory is its sibling. Interpolated into the prompt
+# below so the model sees the fully resolved path rather than the literal
+# variable name.
+AUTOPROBE_PROGRAMS_DIR="$(cd "$(dirname "$0")/../programs" && pwd)"
+
+cat <<EOF
 You are an agent proficient at writing, using, and evolving programs to explore your environment and achieve a goal.
 
 Programs placed in $AUTOPROBE_PROGRAMS_DIR should form an executable, self-validating model of your environment — your **world model**.
