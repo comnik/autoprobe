@@ -144,6 +144,13 @@ autoprobe run --goal "make tests pass"   # inline goal, appended as a final prog
 autoprobe run --debug                    # pause between iterations
 ```
 
+## Evaluation
+
+[ProgramBench](https://programbench.com/) instances are used as a first testing ground for
+`autoprobe`. The `evals` directory contains scripts to setup a
+[sprite](https://sprites.dev/), run an evaluation on it, and download the resulting
+`autoprobe` traces (which are human readable HTML pages).
+
 ## FAQ
 
 **Q: How is this different from having an agent write skills or tools?**
