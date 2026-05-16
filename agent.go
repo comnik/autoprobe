@@ -50,11 +50,10 @@ const (
 	revisionReinforcementName = "revision"
 
 	// Pseudo-tool name under reinforcement/ whose scripts emit the
-	// modeling prompt — a nudge for the agent to compress what it has
-	// learned during a tool-use cycle into a program. Fires when a Step's
-	// in-cycle drag crosses modelingThresholdTokens, and is forced on the
-	// wrap-up turn when -n is exhausted (with $AUTOPROBE_FINAL=1 set so the
-	// script can emit last-chance framing).
+	// modeling prompt — a yield nudge asking the work cycle to close so
+	// the dedicated modeling turn can take over. Fires when a Step's
+	// in-cycle drag crosses modelingThresholdTokens. Wrap-up framing on
+	// the final turn lives in modelingFinalGuidance, not here.
 	modelingReinforcementName = "modeling"
 
 	// Inside a tool-use cycle, the non-program portion of an inference's
@@ -108,8 +107,8 @@ func (k TurnKind) String() string {
 // transcript. Inline rather than a script for the first cut so the
 // implementation diff stays focused; promote to an asset if it grows.
 const modelingGuidance = `[MODELING GUIDANCE]
-Use this turn to update the program library so it reflects what the prior
-work cycle revealed about the environment:
+Use this turn to update the programs in your library, so that your world model reflects
+anything new the prior work cycle revealed about your environment:
 - Compress repeated reads or bash commands into programs that emit the same
   information on the next iteration's first dashboard.
 - Tighten verbose program outputs that took disproportionate context.
@@ -121,12 +120,15 @@ work cycle revealed about the environment:
 When done, respond with a brief plain-text summary and NO further tool calls.`
 
 const modelingBootstrapGuidance = `[MODELING GUIDANCE — BOOTSTRAP]
-The program library is empty (or contains only an inline goal probe). This
+The program library is empty so you don't have a world model yet. This
 is the bootstrap modeling turn before the first work iteration. Install
 initial programs that model the parts of the environment relevant to the
-goal — what's in the repository, what builds, what passes, what's broken —
-so the first work iteration starts from a real dashboard rather than a
-blank one.
+goal.
+
+Some commonly useful programs:
+- test summary and other verifiable success conditions
+- self-validating maps or conceptual models of the codebase
+- todo list / logbook of things you have tried and what you learned from them
 
 When you have installed enough to give the first work cycle traction,
 respond with a brief plain-text summary and NO further tool calls.`
@@ -248,7 +250,7 @@ type Agent struct {
 	lastProgramTokens atomic.Int64
 	lastDrag          atomic.Int64
 	inToolCycle       atomic.Bool
-	modelingFiredAtNs  atomic.Int64
+	modelingFiredAtNs atomic.Int64
 
 	snapshotMu   sync.Mutex
 	lastSnapshot []ProgramSnapshot
@@ -617,7 +619,7 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 		}
 
 		showPrompt = a.advanceOverflowStreak(fresh.overflowed(a.contextBudget))
-		userMsg = a.assembleUserMessage(fresh, showPrompt, false)
+		userMsg = a.assembleUserMessage(fresh, showPrompt)
 		a.conversation = append([]provider.Message{userMsg}, history...)
 		a.idleBackoff = 0
 		a.idlePollsInFlight.Store(0)
@@ -804,7 +806,7 @@ func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bo
 		// the transcript/guidance (the model has seen them). Just emit the
 		// fresh program-output region — modeling guidance is implicit at
 		// this point.
-		userMsg = a.assembleUserMessage(data, false, false)
+		userMsg = a.assembleUserMessage(data, false)
 	}
 	a.conversation = append([]provider.Message{userMsg}, history...)
 	a.lastProgramTokens.Store(int64(data.totalTokens))
@@ -892,6 +894,7 @@ func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bo
 //   - forced: the wrap-up turn after -n was exhausted.
 //   - periodic safety net: this many consecutive work cycles closed with
 //     no other trigger.
+//
 // Skipped when the closed work cycle did no tool calls (idle cycle — nothing
 // to model) and when the previous modeling turn was a no-op without a fresh
 // trigger condition firing.
@@ -1402,25 +1405,25 @@ func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, erro
 	if a.CurrentTurnKind() == TurnModeling {
 		return []provider.Message{a.assembleModelingUserMessage(data, nil, a.needsBootstrap, false)}, nil
 	}
-	return []provider.Message{a.assembleUserMessage(data, false, false)}, nil
+	return []provider.Message{a.assembleUserMessage(data, false)}, nil
 }
 
 // assembleModelingUserMessage builds the user message that kicks off a
 // modeling turn. Three parts in order:
-//   1. The same assembled program-output context the just-closed work cycle
-//      saw (packed with the same lex-order / 80-20 logic so the byte-stable
-//      region cache hit carries over from the work cycle's last request).
-//   2. The prior work cycle's transcript serialized to text — flattened from
-//      provider.Message records so we don't have to round-trip provider-
-//      native signatures (Anthropic thinking, OpenAI reasoning, Google
-//      thought) under a different system prompt where they may not validate.
-//   3. A short guidance block (bootstrap / final / default framing).
+//  1. The same assembled program-output context the just-closed work cycle
+//     saw (packed with the same lex-order / 80-20 logic so the byte-stable
+//     region cache hit carries over from the work cycle's last request).
+//  2. The prior work cycle's transcript serialized to text — flattened from
+//     provider.Message records so we don't have to round-trip provider-
+//     native signatures (Anthropic thinking, OpenAI reasoning, Google
+//     thought) under a different system prompt where they may not validate.
+//  3. A short guidance block (bootstrap / final / default framing).
 //
 // transcript may be nil (bootstrap firing — there is no prior cycle to
 // review). When bootstrap is set, the program-output region is also empty
 // in practice because the library is empty.
 func (a *Agent) assembleModelingUserMessage(d iterationData, transcript []provider.Message, bootstrap, final bool) provider.UserMessage {
-	work := a.assembleUserMessage(d, false, false)
+	work := a.assembleUserMessage(d, false)
 	contents := work.Content
 	if len(transcript) > 0 {
 		var b strings.Builder
@@ -1532,7 +1535,7 @@ func (a *Agent) runIteration(ctx context.Context) (iterationData, error) {
 // programs) and the exploration slot (non-zero-exit inactives lex-ordered
 // first, then a uniform random draw from zero-exit inactives). The goal
 // and revision prompt land at the tail of the context.
-func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt, finalPhase bool) provider.UserMessage {
+func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt bool) provider.UserMessage {
 	var contents []provider.TextContent
 
 	if !d.overflowed(a.contextBudget) {
@@ -1554,13 +1557,6 @@ func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt, finalPh
 	}
 	if showRevisionPrompt {
 		if text := a.runReinforcementPrompt(revisionReinforcementName); text != "" {
-			contents = append(contents, provider.TextContent{Text: text})
-		}
-	}
-	// Wrap-up turn forces a modeling firing in the user message — there is no
-	// tool result to attach to because the cycle just ended.
-	if finalPhase {
-		if text := a.runReinforcementPrompt(modelingReinforcementName, "AUTOPROBE_FINAL=1"); text != "" {
 			contents = append(contents, provider.TextContent{Text: text})
 		}
 	}

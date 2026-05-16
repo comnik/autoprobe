@@ -8,10 +8,10 @@ set -eu
 
 cat <<'EOF'
 [MODELING MODE]
-This is a modeling turn. You are NOT solving the user's task right now. The
-previous work cycle's assistant messages and tool results appear in the
-user message below for context. Your only job is to update the library so it
-remains an accurate executable model of the environment — incorporate
+This is a modeling turn. You are NOT directly pursuing the user's goal right now.
+The previous work cycle's assistant messages and tool results appear in the
+user message below for context. Your only job is to update the world model so it
+remains an accurate executable model your environment — incorporate
 anything the last cycle revealed (a reading you kept re-fetching becomes a
 program that prints the compact summary; a check you kept running becomes a
 program that exits non-zero when the assumption is violated; a computation

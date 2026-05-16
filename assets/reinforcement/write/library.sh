@@ -18,30 +18,21 @@ case "$abs" in
 esac
 
 cat <<'EOF'
-REMEMBER: the programs you write should encode and validate the assumptions they make about
-the environment that you are operating in. If any assumption is violated, the program should
-produce an error alerting you so that you can take corrective action.
-
-REMEMBER: exit code is a status channel, separate from stdout. Exit 0 means the program ran
-successfully (stdout may be normal output or empty). Non-zero exit means something is wrong
-that you should look at — a violated assumption, an environment change, an error condition.
-Do NOT use non-zero exits for "no data" or routine empty output; reserve them for signals
+REMEMBER: the programs in your world model should encode and validate the assumptions they make about
+the environment that you are operating in. Exit code is a status channel, separate from stdout.
+Exit 0 means the program ran successfully (stdout may be normal output or empty). 
+Non-zero exit means something is wrong that requires your attention — a violated assumption, an environment change,
+an error condition. Do NOT use non-zero exits for "no data" or routine empty output; reserve them for signals
 worth attending to now. The harness force-includes non-zero-exit programs in your context.
 
 REMEMBER: program filenames sort lexicographically and the harness packs outputs in that
-order. Models attend more to tokens near the start and end of the context (U-shaped curve,
-"lost in the middle"), so use prefixes deliberately: `aaa-` for the high-attention head,
-`zzz-` for the high-attention tail, plain names for the middle. Under budget pressure, lex
-order also determines drop order (later-sorting first), but rely on `.autoprobe/inactive` —
-not filename gymnastics — to make sure important probes fit. Pick a name that places this
-program in attention space where it belongs.
+order, so use prefixes deliberately to place programs where they belong in attention space.
+Under budget pressure, lex order also determines drop order (later-sorting first), but rely on `.autoprobe/inactive` — not filename gymnastics — to make sure important probes fit.
+Pick a name that places this program in attention space where it belongs.
 
-REMEMBER: The `$AUTOPROBE_PROGRAMS_DIR` directory is the only persistent memory have, so you should write
-programs that model your environment and and compress what you learn about how to achieve
-the user's goal. Prefer executable programs over static files, so that you can encode your
-assumptions.
+REMEMBER: The world model in `$AUTOPROBE_PROGRAMS_DIR` is the only persistent memory have, so make sure it
+captures, compresses, and continuously validates what you learn about your environment, in a way that helps you take action towards the user's goal.
+Prefer executable programs over static files, so that you can encode your assumptions.
 
-All programs you write need to be made executable.
-
-The solution program should also be written to the `$AUTOPROBE_PROGRAMS_DIR` directory.
+REMEMBER: All programs you write need to be made executable.
 EOF

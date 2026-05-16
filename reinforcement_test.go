@@ -40,14 +40,12 @@ func runReinforcement(t *testing.T, script, programsDir, cwd, argsJSON string) s
 
 const (
 	libraryScript  = "assets/reinforcement/write/library.sh"
-	generalScript  = "assets/reinforcement/write/general.sh"
 	revisionScript = "assets/reinforcement/revision/general.sh"
 
 	// Sentinel substrings unique to each reinforcement payload. If the
 	// canonical messages drift, these guards force the tests to be
 	// updated deliberately.
 	libraryMarker     = "lexicographically"
-	generalMarker     = "only persistent memory"
 	revisionMarker    = "[REVISION]"
 	revisionInactive  = "demotion list lives at"
 	revisionRewrite   = "Improve information density"
@@ -106,52 +104,6 @@ func TestLibraryReinforcement_SilentWhenPathMissing(t *testing.T) {
 	}
 }
 
-func TestGeneralReinforcement_FiresForPathOutsideProgramsDir(t *testing.T) {
-	t.Parallel()
-	pd := t.TempDir()
-	elsewhere := t.TempDir()
-	out := runReinforcement(t, generalScript, pd, "",
-		`{"path":"`+filepath.Join(elsewhere, "foo.txt")+`","content":"x"}`)
-	if !strings.Contains(out, generalMarker) {
-		t.Fatalf("expected general reinforcement, got: %q", out)
-	}
-	// The general message should NOT carry the library-only sections.
-	if strings.Contains(out, libraryMarker) {
-		t.Fatalf("general output unexpectedly includes library-only content: %q", out)
-	}
-}
-
-func TestGeneralReinforcement_FiresWhenProgramsDirUnset(t *testing.T) {
-	t.Parallel()
-	// With no programs dir defined, every write is "outside" and should
-	// receive the general nudge.
-	out := runReinforcement(t, generalScript, "", "",
-		`{"path":"/tmp/foo.txt","content":"x"}`)
-	if !strings.Contains(out, generalMarker) {
-		t.Fatalf("expected general reinforcement when programs dir is unset, got: %q", out)
-	}
-}
-
-func TestGeneralReinforcement_SilentForAbsolutePathInsideProgramsDir(t *testing.T) {
-	t.Parallel()
-	pd := t.TempDir()
-	out := runReinforcement(t, generalScript, pd, "",
-		`{"path":"`+filepath.Join(pd, "foo.sh")+`","content":"x"}`)
-	if out != "" {
-		t.Fatalf("expected silence for path inside programs dir, got: %q", out)
-	}
-}
-
-func TestGeneralReinforcement_SilentForRelativePathResolvingInside(t *testing.T) {
-	t.Parallel()
-	root, pd := relativePathSetup(t)
-	out := runReinforcement(t, generalScript, pd, root,
-		`{"path":"programs/foo.sh","content":"x"}`)
-	if out != "" {
-		t.Fatalf("expected silence for relative path resolving inside programs dir, got: %q", out)
-	}
-}
-
 // relativePathSetup builds a programs dir under a temp root and returns
 // both paths canonicalized through filepath.EvalSymlinks. On macOS,
 // $TMPDIR commonly resolves through /var → /private/var, so the
@@ -173,15 +125,6 @@ func relativePathSetup(t *testing.T) (root, pd string) {
 		t.Fatalf("EvalSymlinks(pd): %v", err)
 	}
 	return rootResolved, pdResolved
-}
-
-func TestGeneralReinforcement_SilentWhenPathMissing(t *testing.T) {
-	t.Parallel()
-	pd := t.TempDir()
-	out := runReinforcement(t, generalScript, pd, "", `{"content":"x"}`)
-	if out != "" {
-		t.Fatalf("expected silence when path is missing, got: %q", out)
-	}
 }
 
 // installRevisionScript copies the shipped asset into a temp probe-dir
