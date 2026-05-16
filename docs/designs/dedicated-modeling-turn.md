@@ -2,12 +2,13 @@
 
 ## Implementation status
 
-**Proposed.** Not yet implemented. This is the first of three designs aimed at
-relieving the tension between the agent's user-provided goal and its meta-goal
-of modeling the environment in the program library; the other two
+**Landed.** The work/modeling split is live in `agent.go` (see `TurnKind`,
+`stepModeling`, `assembleModelingUserMessage`, and the
+`identity.sh`/`work.sh`/`modeling.sh` system assets). A few details
+diverged from the design as written; they are flagged inline below with
+**[diverged]** notes. The other two designs in this thread
 ([signal-driven reinforcement](signal-driven-reinforcement.md) and
-[probe-debt meta-probe](probe-debt-meta-probe.md)) are deferred and to be
-revisited after this one lands.
+[probe-debt meta-probe](probe-debt-meta-probe.md)) remain deferred.
 
 ## Problem
 
@@ -183,10 +184,13 @@ cycle to look at:
    work iteration starts from a real dashboard rather than a blank
    one."*
 
-The bootstrap firing is gated by an env var (`AUTOPROBE_BOOTSTRAP=1`)
-passed to the script that emits the guidance, mirroring how
-`AUTOPROBE_FINAL` switches the existing reinforcement to last-chance
-framing today.
+**[diverged]** The implementation does not use `AUTOPROBE_BOOTSTRAP`.
+Bootstrap framing is selected in-process: `Prime` sets
+`a.needsBootstrap=true` when `programs/` is empty, and
+`assembleModelingUserMessage` switches the guidance constant from
+`modelingGuidance` to `modelingBootstrapGuidance`. The guidance text
+lives inline in `agent.go` rather than in a script asset — promote it
+to `assets/system/modeling-guidance/*.sh` if it grows.
 
 A bootstrap modeling turn that produces no library mutations is a
 warning sign — the agent declined to install anything despite an empty
@@ -228,6 +232,14 @@ The trigger plumbing stays as it is — same threshold, same cooldown,
 same `modelingFired` flag — because the trigger is also what tells the
 modeling-turn cadence (above) that a modeling turn should fire. The
 content change is one shell script and nothing else.
+
+**[diverged]** An early version of the script kept an
+`AUTOPROBE_FINAL=1` branch that emitted last-iteration framing when
+the wrap-up turn fired. That branch is gone: the wrap-up runs as a
+modeling turn (per the forced trigger above), and its framing lives
+in the `modelingFinalGuidance` constant selected by
+`assembleModelingUserMessage(..., final=true)`. The reinforcement
+script now does the yield-only job and nothing else.
 
 Once we have measured the effect of the modeling turn, a follow-up rename
 of the in-cycle thing (directory `assets/reinforcement/modeling/` →
@@ -507,6 +519,11 @@ of held in tension *within* turns. Everything else follows from that.
   but capped well short of runaway. Tune empirically.
 - **Should the modeling turn see the *next* work cycle's anticipated
   framing?** I.e., should it know what the user goal still is so it can
-  prioritize what to capture? Probably yes — the goal probe is part of the
-  program-output context the modeling turn already sees, so this comes for
-  free.
+  prioritize what to capture? **Resolved (with a divergence).** The
+  modeling turn sees the goal. The design assumed it would arrive "for
+  free" as a goal probe in the library; the implementation instead
+  appends `--goal` as a dedicated `[YOUR GOAL]` text block at the tail
+  of `assembleUserMessage`, which `assembleModelingUserMessage`
+  inherits. Same outcome (goal visible in both turn kinds), different
+  mechanism. Worth revisiting if/when we want a single source of truth
+  in the library.
