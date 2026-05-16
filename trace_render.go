@@ -41,6 +41,9 @@ type indexView struct {
 type indexIter struct {
 	N                   int
 	NPadded             string
+	WorkIteration       int
+	TurnKind            string // "work" (default) or "modeling"
+	IsModeling          bool   // convenience for templates
 	HTMLFile            string
 	RelStart            string
 	DurationStr         string
@@ -56,6 +59,8 @@ type indexIter struct {
 type iterView struct {
 	Header          RunHeader
 	Iter            IterationTrace
+	TurnKind        string // "work" (default) or "modeling"
+	IsModeling      bool
 	DurationStr     string
 	IdleWaitStr     string
 	BudgetPercent   float64
@@ -150,9 +155,16 @@ func renderIteration(dir string, header RunHeader, rec IterationTrace, prevN, ne
 
 func newIndexIter(h RunHeader, e iterationLogEntry) indexIter {
 	rel := e.StartedAt.Sub(h.StartedAt)
+	kind := e.TurnKind
+	if kind == "" {
+		kind = "work"
+	}
 	return indexIter{
 		N:                   e.N,
 		NPadded:             fmt.Sprintf("%0*d", tracePadding, e.N),
+		WorkIteration:       e.WorkIteration,
+		TurnKind:            kind,
+		IsModeling:          kind == "modeling",
 		HTMLFile:            iterationHTMLName(e.N),
 		RelStart:            formatRelDuration(rel),
 		DurationStr:         formatMs(e.DurationMs),
@@ -175,9 +187,15 @@ func buildIterView(header RunHeader, rec IterationTrace, prevN, nextN, total int
 			budgetPct = 100
 		}
 	}
+	kind := rec.TurnKind
+	if kind == "" {
+		kind = "work"
+	}
 	v := iterView{
 		Header:          header,
 		Iter:            rec,
+		TurnKind:        kind,
+		IsModeling:      kind == "modeling",
 		DurationStr:     formatMs(durMs),
 		IdleWaitStr:     formatMs(rec.IdleWaitMs),
 		BudgetPercent:   budgetPct,

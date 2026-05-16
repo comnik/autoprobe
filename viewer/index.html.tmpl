@@ -30,6 +30,7 @@
       <thead>
         <tr>
           <th>#</th>
+          <th>kind</th>
           <th>start (Δ)</th>
           <th class="num">dur</th>
           <th class="num">in / out</th>
@@ -39,8 +40,9 @@
       </thead>
       <tbody>
         {{range .Iterations}}
-        <tr>
+        <tr{{if .IsModeling}} class="modeling-row"{{end}}>
           <td class="iter-link"><a href="{{.HTMLFile}}">{{.NPadded}}</a></td>
+          <td>{{if .IsModeling}}<span class="badge modeling" title="modeling turn">modeling</span>{{else}}<span class="badge work" title="work turn">work</span>{{end}}</td>
           <td>{{.RelStart}}{{if .IdlePollsBefore}} <span class="badge demoted" title="idle polls before this iteration">+{{.IdlePollsBefore}} idle</span>{{end}}</td>
           <td class="num">{{.DurationStr}}</td>
           <td class="num">{{.InputTokens | formatThousands}} / {{.OutputTokens | formatThousands}}</td>

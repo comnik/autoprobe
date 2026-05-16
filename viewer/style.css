@@ -141,6 +141,10 @@ table.iter-list .empty { padding: 24px; text-align: center; color: var(--muted);
 .badge.phase    { background: var(--customMessageBg); color: var(--customMessageLabel); border-color: var(--customMessageLabel); }
 .badge.stop-end { background: var(--toolSuccessBg); color: var(--success); border-color: var(--success); }
 .badge.stop     { background: var(--body-bg); color: var(--muted); }
+.badge.modeling { background: var(--customMessageBg); color: var(--customMessageLabel); border-color: var(--customMessageLabel); }
+.badge.work     { background: var(--body-bg); color: var(--muted); border-style: dashed; }
+.modeling-row td { opacity: 0.92; }
+.iter-subtitle { color: var(--muted); font-weight: normal; margin-left: 0.5em; font-size: 0.9em; }
 
 /* ---------- Iteration page ---------- */
 .iter-nav {

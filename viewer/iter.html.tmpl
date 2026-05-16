@@ -16,7 +16,11 @@
       <a href="index.html">↑ index</a>
       {{if .NextHref}}<a href="{{.NextHref}}">iter {{.NextN}} →</a>{{else}}<span class="disabled">iter →</span>{{end}}
       <span class="spacer"></span>
-      <span class="iter-title">iteration {{.Iter.Iteration}} / {{.TotalIterations}}</span>
+      <span class="iter-title">
+        record {{.Iter.Iteration}} / {{.TotalIterations}}
+        {{if .IsModeling}}<span class="badge modeling" title="modeling turn — library curation, not user-goal work">modeling</span>{{else}}<span class="badge work" title="work turn — pursuing the user goal">work</span>{{end}}
+        {{if .Iter.WorkIteration}}<span class="iter-subtitle">work iter {{.Iter.WorkIteration}}</span>{{end}}
+      </span>
       <span class="kbd-hint"><span class="kbd">←</span><span class="kbd">→</span> nav · <span class="kbd">esc</span> index · <span class="kbd">g</span> goto</span>
     </div>
 

@@ -264,6 +264,7 @@ func (m tuiModel) renderPhase(width int) string {
 		{PhaseRunPrograms, "running programs"},
 		{PhaseInference, "inference"},
 		{PhaseTools, "tools"},
+		{PhaseModeling, "modeling"},
 		{PhaseIdle, "idle"},
 	}
 	var parts []string
