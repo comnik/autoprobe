@@ -43,6 +43,11 @@ type tuiModel struct {
 	// refresh. The agent's snapshot would otherwise re-assert
 	// ChangedThisIter on every tick within the same iteration.
 	pulsedAtIter map[string]int
+
+	// animFrame advances on every animTickMsg and indexes into the
+	// active turn-kind animation in the phase strip. Wrapping is done
+	// at render time so the counter never needs to reset.
+	animFrame int
 }
 
 type primedMsg struct{ err error }
@@ -53,10 +58,20 @@ type stepMsg struct {
 }
 
 type tickMsg struct{}
+type animTickMsg struct{}
 type phaseMsg struct{}
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+// animTickInterval paces the phase-strip animation. ~300 ms × 6 frames
+// gives a ~1.8 s cycle — slow enough to read as ambient motion rather
+// than something demanding attention.
+const animTickInterval = 300 * time.Millisecond
+
+func animTickCmd() tea.Cmd {
+	return tea.Tick(animTickInterval, func(time.Time) tea.Msg { return animTickMsg{} })
 }
 
 func runTUI(ctx context.Context, agent *Agent) error {
@@ -78,6 +93,7 @@ func (m tuiModel) Init() tea.Cmd {
 			return primedMsg{err: err}
 		},
 		tickCmd(),
+		animTickCmd(),
 		waitPhase(m.phaseCh),
 	)
 }
@@ -118,6 +134,21 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		return m, tickCmd()
+
+	case animTickMsg:
+		// stateError is terminal: drop the ticker entirely so it doesn't
+		// keep firing for the rest of the session.
+		if m.state == stateError {
+			return m, nil
+		}
+		// PhaseIdle is transient: the agent is waiting for the user, so
+		// freeze the frame but keep the ticker alive so motion resumes
+		// the moment a phase transition fires.
+		if m.agent.Phase() == PhaseIdle {
+			return m, animTickCmd()
+		}
+		m.animFrame++
+		return m, animTickCmd()
 
 	case phaseMsg:
 		return m, waitPhase(m.phaseCh)
@@ -165,7 +196,6 @@ func (m tuiModel) View() string {
 	sep := strings.Repeat("─", cw)
 	sections := []string{
 		m.renderHeader(cw),
-		"",
 		m.renderPhase(cw),
 		sep,
 		m.renderTokens(cw),
@@ -223,12 +253,6 @@ var (
 	barEmpty     = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	flashStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 
-	// Turn-kind badge styles. Work is the muted resting state; modeling
-	// is bright so the operator can tell at a glance which kind of turn
-	// the dashboard's pips belong to.
-	turnWorkBadgeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	turnModelingBadgeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
-
 	// Library segments alternate through this palette so adjacent
 	// active programs are visually distinguishable even when their
 	// segments are all "active, unchanged". Hand-picked greens with
@@ -260,14 +284,29 @@ func (m tuiModel) renderHeader(width int) string {
 	return left + strings.Repeat(" ", pad) + right
 }
 
+// renderPhase renders a 3-row block: an animated turn-kind indicator
+// on the left (concentric pings for modeling, wavefront for work) with
+// the phase pips and cycles counter on a single horizontal line that
+// sits on the animation's middle row. The animation encodes the turn
+// kind, so no separate badge is needed.
 func (m tuiModel) renderPhase(width int) string {
 	cur := m.agent.Phase()
+	kind := m.agent.CurrentTurnKind()
+
+	frames := wavefront
+	animStyle := workAnimStyle
+	if kind == TurnModeling {
+		frames = concentricPings
+		animStyle = modelingAnimStyle
+	}
+	frame := frames[m.animFrame%len(frames)]
+
 	type pip struct {
 		val   uint32
 		label string
 	}
 	pips := []pip{
-		{PhaseRunPrograms, "running programs"},
+		{PhaseRunPrograms, "library"},
 		{PhaseInference, "inference"},
 		{PhaseTools, "tools"},
 		{PhaseIdle, "idle"},
@@ -282,19 +321,25 @@ func (m tuiModel) renderPhase(width int) string {
 		}
 		parts = append(parts, style.Render(mark)+" "+pipLabel.Render(p.label))
 	}
-	// Turn kind is a parallel axis to the phase: a modeling turn still
-	// walks through RunPrograms → Inference → Tools, but the operator
-	// wants to know which kind of turn those sub-stages belong to. Render
-	// it as a sustained badge alongside the pips rather than mixing it
-	// into the phase enum.
-	turnBadge := turnKindBadge(m.agent.CurrentTurnKind())
-	left := strings.Join(parts, "   ") + "   " + turnBadge
-	right := infoStyle.Render(fmt.Sprintf("cycles: %d", m.agent.ToolCycles()))
-	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
-	if pad < 1 {
-		pad = 1
+	pipLine := strings.Join(parts, "   ")
+	cyclesStr := infoStyle.Render(fmt.Sprintf("cycles: %d", m.agent.ToolCycles()))
+
+	mid := animRows / 2
+	rows := make([]string, animRows)
+	for i := 0; i < animRows; i++ {
+		left := animStyle.Render(frame[i])
+		var right string
+		if i == mid {
+			left += "    " + pipLine
+			right = cyclesStr
+		}
+		pad := width - lipgloss.Width(left) - lipgloss.Width(right)
+		if pad < 1 {
+			pad = 1
+		}
+		rows[i] = left + strings.Repeat(" ", pad) + right
 	}
-	return left + strings.Repeat(" ", pad) + right
+	return strings.Join(rows, "\n")
 }
 
 func (m tuiModel) renderTokens(width int) string {
@@ -567,16 +612,6 @@ func (m tuiModel) renderAssistant(width int) string {
 		return mutedStyle.Render("(waiting for first response)")
 	}
 	return asstStyle.Width(width).Render(text)
-}
-
-// turnKindBadge renders the current turn kind as a sustained badge for
-// the phase strip. Phase pips describe the sub-stage of one inference;
-// this badge describes which kind of turn that inference is part of.
-func turnKindBadge(k TurnKind) string {
-	if k == TurnModeling {
-		return turnModelingBadgeStyle.Render("◆ MODELING")
-	}
-	return turnWorkBadgeStyle.Render("◇ work")
 }
 
 func latestAssistantText(conversation []provider.Message) string {
