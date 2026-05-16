@@ -301,7 +301,17 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 	a.updateStats(data.results, joinAssistantText(msg.Content))
 
 	a.iteration++
-	a.lastOutputHash = data.hash
+	// On the StopToolUse → StopEnd transition the agent has yielded after
+	// doing real work, and its narrative typically expects "the next cycle
+	// to start clean." Clear the cached hash so the next Step's idle check
+	// fails and the agent gets one fresh inference with its updated
+	// programs in context. A subsequent StopEnd-after-StopEnd stores the
+	// real hash and idles as normal, so we don't loop on repeated yields.
+	if msg.StopReason == provider.StopEnd && a.lastStopReason == provider.StopToolUse {
+		a.lastOutputHash = programHash{}
+	} else {
+		a.lastOutputHash = data.hash
+	}
 	a.lastStopReason = msg.StopReason
 	a.conversation = append(a.conversation, msg)
 

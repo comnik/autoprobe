@@ -519,6 +519,61 @@ func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
 	}
 }
 
+func TestStepRunsFreshInferenceAfterCycleEndsEvenIfProgramsStable(t *testing.T) {
+	t.Parallel()
+	// The first cycle runs StopToolUse → StopEnd. Programs are deterministic
+	// (the counter writes via runIteration, but the model itself does no
+	// tool calls in the StopEnd step). Without clearing lastOutputHash on
+	// the cycle-end transition, Step 3 would hit the idle branch because
+	// the program hash hasn't changed since Step 2. With the clear, Step 3
+	// runs a fresh inference — that's the "clean next cycle" the model's
+	// narrative typically asks for.
+	prov := &scriptedProvider{
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "distilling and yielding"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "still done"}}, StopReason: provider.StopEnd},
+		},
+	}
+	a := newTestAgent(t, prov)
+
+	runSteps(t, a, 3)
+
+	if got := len(prov.calls); got != 3 {
+		t.Fatalf("provider call count: got %d, want 3 (the third must run despite stable program hash)", got)
+	}
+}
+
+func TestStepIdlesAfterRepeatedYieldsWithStableHash(t *testing.T) {
+	t.Parallel()
+	// After the first StopEnd (post-cycle) re-queries, a SECOND StopEnd with
+	// no tool calls in between should NOT clear the hash again — otherwise
+	// we'd loop forever. The third Step is allowed to idle. We drive the
+	// agent until the idle branch fires by giving it a context that expires
+	// quickly: a stale program output hash + a StopEnd-after-StopEnd should
+	// route into the idle backoff, not into another provider call.
+	prov := &scriptedProvider{
+		responses: []provider.AssistantMessage{
+			{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "yield 1"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "yield 2"}}, StopReason: provider.StopEnd},
+		},
+	}
+	a := newTestAgent(t, prov)
+
+	runSteps(t, a, 3)
+
+	// After Step 3 returned StopEnd-after-StopEnd, lastOutputHash must be
+	// the real hash (not the zero/cleared one), so a hypothetical Step 4
+	// would hit the idle branch instead of re-querying. Asserting on the
+	// stored hash is the cleanest check: zero means "we would re-query",
+	// non-zero means "we'd idle on a stable cycle."
+	var zero programHash
+	if a.lastOutputHash == zero {
+		t.Fatalf("lastOutputHash was cleared after StopEnd-after-StopEnd; idle would never engage and we'd loop")
+	}
+}
+
 func TestStepClearsDistillCooldownWhenCycleEnds(t *testing.T) {
 	t.Parallel()
 	// A cycle that fires the distill prompt and then ends naturally must
