@@ -26,10 +26,10 @@ const (
 	idleBackoffMax        = 30 * time.Second
 	maxProgramConcurrency = 8
 
-	// Token ceiling for the assembled program-output portion of the context.
-	// 128K assumes a 256K base window — the size frontier models are still
-	// trained on — leaving roughly half the window for in-flight tool use.
-	defaultContextBudgetTokens = 128 * 1024
+	// Token ceiling for the assembled program-output portion of the context. 64K assumes a
+	// 128K maximum effective context window, leaving roughly half the window for in-flight
+	// tool use.
+	defaultContextBudgetTokens = 64_000
 
 	// Fraction of the budget reserved for active programs; the remainder is
 	// the exploration slot. Encoded as a percentage so the 80/20 split is

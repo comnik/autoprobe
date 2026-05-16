@@ -3,7 +3,7 @@
 ## Implementation status
 
 - **2026-05-12** (`43a7e19`): Core mechanics landed. Context limit (default
-  128K tokens, configurable on the Agent), `.autoprobe/inactive` parsing,
+  64K tokens, configurable on the Agent), `.autoprobe/inactive` parsing,
   inclusion algorithm with the 80/20 split and skipped-program sentinels,
   exploration slot (non-zero-exit inactives lex-ordered then uniform-random
   zero-exit draws), pre-selection `(name, exit, stdout)` hash for idle
@@ -49,11 +49,10 @@ participates in deciding which programs' output gets into the context.
 ### Context limit
 
 The harness maintains a configurable maximum context size for program outputs (default:
-**128K tokens**). This budget covers the assembled program output portion of the context
+**64K tokens**). This budget covers the assembled program output portion of the context
 only; the remaining room in the model's window is left for the current tool-calling
-cycle (assistant turns and tool results). 128K assumes a 256K base window — the size
-frontier models are still trained on — leaving roughly half the window for in-flight
-tool use.
+cycle (assistant turns and tool results). 64K assumes a 128K maximum effective context
+window, leaving roughly half the window for in-flight tool use.
 
 ### Always run, conditionally include
 

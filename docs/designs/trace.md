@@ -117,7 +117,7 @@ Shape — first line:
 {"kind": "run", "format_version": 1, "autoprobe_version": "0.5.3",
  "started_at": "2026-05-13T10:30:00Z", "probe_dir": ".autoprobe",
  "provider": "anthropic", "model": "claude-opus-4-7",
- "goal": "investigate slow startup", "context_budget_tokens": 131072}
+ "goal": "investigate slow startup", "context_budget_tokens": 64000}
 ```
 
 Shape — iteration lines:
