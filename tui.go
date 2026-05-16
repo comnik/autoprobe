@@ -162,13 +162,15 @@ func (m tuiModel) View() string {
 	cw := m.contentWidth()
 
 	bars := m.renderBars(cw)
+	sep := strings.Repeat("─", cw)
 	sections := []string{
 		m.renderHeader(cw),
+		"",
 		m.renderPhase(cw),
-		strings.Repeat("─", cw),
+		sep,
 		m.renderTokens(cw),
 		bars,
-		strings.Repeat("─", cw),
+		sep,
 		m.renderAssistant(cw),
 	}
 	return strings.Join(sections, "\n")
@@ -190,8 +192,8 @@ func (m tuiModel) renderBars(width int) string {
 	}
 
 	rows := []string{
-		m.renderBar(width, "budget", budget.pct, budget.fill, budget.annotation, slot, 0.8),
 		m.renderBar(width, "drag", drag.pct, drag.fill, drag.annotation, slot, -1),
+		m.renderBar(width, "budget", budget.pct, budget.fill, budget.annotation, slot, 0.8),
 		m.renderLibraryBar(width, lib, slot),
 	}
 	return strings.Join(rows, "\n")
@@ -204,13 +206,13 @@ type barState struct {
 }
 
 var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
-	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
+	infoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	mutedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	errStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
 	errBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("203"))
-	footerKey    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-	footerLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	footerKey      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	footerLabel    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	asstStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	pipOnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
 	pipOffStyle  = mutedStyle
@@ -242,9 +244,7 @@ func (m tuiModel) renderHeader(width int) string {
 	}
 	left := title + "   " + infoStyle.Render(model+idle)
 	right := footerKey.Render("q") + footerLabel.Render(" quit")
-	if m.state == stateDone {
-		right = footerKey.Render("enter") + footerLabel.Render(" exit")
-	} else if m.state == stateError {
+	if m.state == stateDone || m.state == stateError {
 		right = footerKey.Render("enter") + footerLabel.Render(" exit")
 	}
 	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
@@ -573,30 +573,26 @@ func latestAssistantText(conversation []provider.Message) string {
 }
 
 
+// humanInt formats a token count compactly: integers below 1K, one decimal
+// in the 1K–10K range (e.g. "1.2K"), and rounded integers thereafter (e.g.
+// "131K", "1.5M"). Uses base-1000 scaling so the displayed numbers match
+// the canonical "131K context window" rather than the 1024-based 128K.
 func humanInt(n int) string {
 	if n < 0 {
 		n = 0
 	}
-	if n < 1000 {
+	switch {
+	case n < 1000:
 		return fmt.Sprintf("%d", n)
+	case n < 10_000:
+		return fmt.Sprintf("%.1fK", float64(n)/1000)
+	case n < 1_000_000:
+		return fmt.Sprintf("%dK", (n+500)/1000)
+	case n < 10_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	default:
+		return fmt.Sprintf("%dM", (n+500_000)/1_000_000)
 	}
-	// Insert thousands separators.
-	s := fmt.Sprintf("%d", n)
-	var b strings.Builder
-	off := len(s) % 3
-	if off > 0 {
-		b.WriteString(s[:off])
-		if len(s) > off {
-			b.WriteString(",")
-		}
-	}
-	for i := off; i < len(s); i += 3 {
-		b.WriteString(s[i : i+3])
-		if i+3 < len(s) {
-			b.WriteString(",")
-		}
-	}
-	return b.String()
 }
 
 func clampPct(p float64) int {
