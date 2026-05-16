@@ -77,15 +77,14 @@ func TestHashResultsFlipsWhenExitCodeChanges(t *testing.T) {
 	}
 }
 
-func TestRunProgramsFlagsNonExecutableFile(t *testing.T) {
+func TestRunProgramsChmodsNonExecutableFile(t *testing.T) {
 	t.Parallel()
-	// A file dropped into the programs dir without execute bits would
-	// otherwise make exec error out and abort the iteration. The guardrail
-	// should turn that into a non-zero-exit result so the message lands in
-	// the agent's context and can be corrected.
+	// The write tool creates files as 0644, and the agent reliably forgets to
+	// chmod +x before the next iteration. runPrograms sets the execute bit
+	// itself rather than burning a turn on the fix.
 	a := newAgentWithPrograms(t, programSpec{"good", "#!/bin/sh\necho ok\n"})
 	bad := filepath.Join(a.programsDir, "bad")
-	if err := os.WriteFile(bad, []byte("#!/bin/sh\necho should-not-run\n"), 0644); err != nil {
+	if err := os.WriteFile(bad, []byte("#!/bin/sh\necho ran\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -103,14 +102,18 @@ func TestRunProgramsFlagsNonExecutableFile(t *testing.T) {
 	if got == nil {
 		t.Fatal("expected a result row for the non-executable file")
 	}
-	if got.exitCode == 0 {
-		t.Errorf("non-executable file must surface with non-zero exit (force-includes it); got 0")
+	if got.exitCode != 0 {
+		t.Errorf("file should run successfully after auto-chmod; got exit %d, output %q", got.exitCode, got.output)
 	}
-	if !strings.Contains(string(got.output), "not executable") {
-		t.Errorf("output should explain the problem; got %q", got.output)
+	if !strings.Contains(string(got.output), "ran") {
+		t.Errorf("output should be from the program; got %q", got.output)
 	}
-	if !strings.Contains(string(got.output), "bad") {
-		t.Errorf("output should name the offending program; got %q", got.output)
+	info, err := os.Stat(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&0o111 == 0 {
+		t.Errorf("execute bit should be set on disk after run; mode=%v", info.Mode())
 	}
 }
 

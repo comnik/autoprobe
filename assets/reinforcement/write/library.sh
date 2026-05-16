@@ -33,6 +33,4 @@ Pick a name that places this program in attention space where it belongs.
 REMEMBER: The world model in `$AUTOPROBE_PROGRAMS_DIR` is the only persistent memory have, so make sure it
 captures, compresses, and continuously validates what you learn about your environment, in a way that helps you take action towards the user's goal.
 Prefer executable programs over static files, so that you can encode your assumptions.
-
-REMEMBER: All programs you write need to be made executable.
 EOF

@@ -1667,17 +1667,13 @@ func (a *Agent) runPrograms(ctx context.Context) ([]programResult, error) {
 			if statErr != nil {
 				return fmt.Errorf("stat %s: %w", name, statErr)
 			}
-			// A program file with no execute bit set would surface as an opaque
-			// "permission denied" exec error that aborts the iteration. Convert
-			// it into a non-zero-exit result so the message reaches the model's
-			// context (force-included by the alarm channel) and can be fixed.
+			// The write tool creates files as 0644, and the agent reliably forgets
+			// to chmod +x before the next iteration. Rather than burning a turn on
+			// the fix, just set the execute bit ourselves.
 			if info.Mode()&0o111 == 0 {
-				results[i] = programResult{
-					name:     name,
-					exitCode: 126,
-					output:   []byte(fmt.Sprintf("[program %s is not executable]\n", name)),
+				if err := os.Chmod(path, info.Mode()|0o111); err != nil {
+					return fmt.Errorf("chmod %s: %w", name, err)
 				}
-				return nil
 			}
 			start := time.Now()
 			out, runErr := exec.CommandContext(gctx, path).CombinedOutput()
