@@ -155,24 +155,24 @@ accessor — `LastProgramTokens()` — is sufficient.
 ### In-cycle drag bar
 
 A second horizontal bar shows the current tool-use cycle's working-
-set drag against `distillThresholdTokens` (32K). The drag value is
+set drag against `modelingThresholdTokens` (32K). The drag value is
 `provider.AssistantMessage.Usage.InputTokens − iterationData.totalTokens`
 — the same quantity `Step` computes to decide whether to fire the
-DISTILL prompt — and reflects how much prior assistant/tool history
+MODELING prompt — and reflects how much prior assistant/tool history
 the current cycle is dragging forward.
 
-The bar fills proportionally to `drag / distillThresholdTokens`. When
+The bar fills proportionally to `drag / modelingThresholdTokens`. When
 drag exceeds the threshold the bar turns red and stays red; this is
-the same condition that triggers the distill firing (modulo
+the same condition that triggers the modeling firing (modulo
 cooldown), so the visual matches the harness's actual decision.
 
-When a DISTILL prompt has been attached to the most recent step —
+When a MODELING prompt has been attached to the most recent step —
 either the periodic in-cycle firing or the forced wrap-up firing on
-`finalPhase` — the bar flashes a "DISTILL" badge alongside the
+`finalPhase` — the bar flashes a "MODELING" badge alongside the
 percentage for a small number of refresh ticks. The flash is a
 notice, not a sustained state: the operator should see *that* it
 fired without the dashboard looking permanently alarmed afterwards.
-The cooldown counter (`distillCooldown`) is not surfaced — it's
+The cooldown counter (`modelingCooldown`) is not surfaced — it's
 internal bookkeeping and would clutter the bar without changing
 anything the operator can act on.
 
@@ -184,8 +184,8 @@ climbs again on the next one.
 
 Surfacing this needs `Agent` to expose the most recent step's drag
 value and a flag indicating whether the most recent step attached a
-DISTILL prompt. Two small accessors (`LastDrag()` and
-`LastDistillFired()`), or a single bundled "last step vitals" struct
+MODELING prompt. Two small accessors (`LastDrag()` and
+`LastModelingFired()`), or a single bundled "last step vitals" struct
 if more values accumulate, are enough.
 
 ### Library bar
@@ -295,7 +295,7 @@ program snapshot) updates via the existing `stepMsg` handler.
 
 - `agent.go` — add `phase` atomic, `totalInputTokens` /
   `totalOutputTokens` counters, `toolCycles` counter, last-step drag
-  + distill-fired flag, and accessor methods. Wire phase transitions
+  + modeling-fired flag, and accessor methods. Wire phase transitions
   into `Step`. Remove the `debug` / step-through plumbing
   (`StepThrough`, the `s`-key wiring path) since it no longer has a
   consumer.
@@ -323,6 +323,6 @@ program snapshot) updates via the existing `stepMsg` handler.
   on a 1s heartbeat. Holding the bright fill for two or three ticks
   is an easy follow-up if the single-tick version reads as a flicker
   rather than a signal in practice. The same question applies to the
-  DISTILL-fired flash on the drag bar; both should probably use the
+  MODELING-fired flash on the drag bar; both should probably use the
   same duration so the dashboard's "something just happened" signals
   read consistently.

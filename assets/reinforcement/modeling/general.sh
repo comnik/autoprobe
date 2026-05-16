@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Reinforcement that nudges the agent to distill what it has learned during
-# the current tool-use cycle into an executable program in $PROGRAMS_DIR.
-# Fires periodically once cumulative in-cycle input tokens cross a threshold
-# (see distillThresholdTokens in agent.go) by appending to the last tool
-# result, and once unconditionally on the wrap-up turn after -n is exhausted
-# via the leading user message. The wrap-up firing sets $AUTOPROBE_FINAL=1
-# so we can switch to last-chance framing.
+# Reinforcement that nudges the agent to update its executable model of the
+# environment — the programs in $PROGRAMS_DIR — with what it has learned
+# during the current tool-use cycle. Fires periodically once cumulative
+# in-cycle input tokens cross a threshold (see modelingThresholdTokens in
+# agent.go) by appending to the last tool result, and once unconditionally
+# on the wrap-up turn after -n is exhausted via the leading user message.
+# The wrap-up firing sets $AUTOPROBE_FINAL=1 so we can switch to last-chance
+# framing.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -34,10 +35,12 @@ EOF
 fi
 
 cat <<EOF
-[DISTILL]
+[MODELING]
 You have accumulated significant in-cycle context this tool-use cycle. The
 conversation history is ephemeral — it will be wiped when this cycle ends,
 so anything not committed to a program in $PROGRAMS_DIR is about to be lost.
+The programs in $PROGRAMS_DIR are your executable model of the environment;
+this is the moment to update that model with what you have just learned.
 
 Now is the right moment to:
   1. Write or update a program in $PROGRAMS_DIR that captures what you have

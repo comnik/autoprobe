@@ -3,17 +3,17 @@
 ## Implementation status
 
 **Proposed, deferred.** Not yet implemented. To be revisited after
-[dedicated distill turn](dedicated-distill-turn.md) lands and we have
+[dedicated modeling turn](dedicated-modeling-turn.md) lands and we have
 measured its effect on library quality.
 
 ## Problem
 
-Today's distillation reinforcement (`assets/reinforcement/distill/general.sh`)
+Today's modeling reinforcement (`assets/reinforcement/modeling/general.sh`)
 fires on a single trigger: cumulative in-cycle input tokens crossing a
 configured threshold. That is a coarse proxy for "you might have learned
 something worth capturing." It catches the case where the agent is grinding
 on a task and accumulating context, but it does not tell the agent *what*
-specifically would be worth distilling. The reinforcement reads as a general
+specifically would be worth modeling. The reinforcement reads as a general
 nag — "compress and yield" — and the agent has to do its own diagnosis of
 what to compress.
 
@@ -54,7 +54,7 @@ When a signal triggers, the harness fires a reinforcement that *names the
 specific repetition*. Examples:
 
 ```
-[DISTILL: repeated read]
+[MODELING: repeated read]
 You read foo/bar.go three times this cycle. The salient information you
 extracted each time was approximately:
   - line 42: the SessionContext struct definition
@@ -64,28 +64,28 @@ with it in context.
 ```
 
 ```
-[DISTILL: repeated bash]
+[MODELING: repeated bash]
 You ran `pytest tests/auth/ -x` four times this cycle. This is a candidate
 for a probe — running it from a probe means the next cycle starts knowing
 whether auth tests pass, without you having to invoke pytest yourself.
 ```
 
 The reinforcement is appended to the most recent tool result the same way
-today's `distill/general.sh` is. The key difference is that the message
+today's `modeling/general.sh` is. The key difference is that the message
 references concrete state from the agent's own history, not a generic
-prompt about distillation.
+prompt about what to model.
 
-### Interaction with the dedicated distill turn
+### Interaction with the dedicated modeling turn
 
-These signals are also valuable inputs to the [dedicated distill
-turn](dedicated-distill-turn.md). When that design lands, the distill
+These signals are also valuable inputs to the [dedicated modeling
+turn](dedicated-modeling-turn.md). When that design lands, the modeling
 turn's user message can include a "things you repeated" section derived
-from the same detectors — turning the distill turn from a generic
+from the same detectors — turning the modeling turn from a generic
 "review what happened" prompt into a checklist of concrete capture
 opportunities.
 
 In other words: the same signals serve two purposes — gentle in-cycle
-nudges (this design) and structured input to the dedicated distill turn
+nudges (this design) and structured input to the dedicated modeling turn
 (the other design). Implementing the detection once supports both.
 
 ### Suppression and cooldown

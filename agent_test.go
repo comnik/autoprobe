@@ -344,12 +344,12 @@ func TestStepMixedCycleResetsOnlyAfterStopEnd(t *testing.T) {
 	}
 }
 
-// writeDistillScript drops a distill reinforcement script into the agent's
-// reinforcement/distill/ directory. Mirror of writeRevisionScript from
+// writeModelingScript drops a modeling reinforcement script into the agent's
+// reinforcement/modeling/ directory. Mirror of writeRevisionScript from
 // budget_test.go (kept local rather than exporting that helper).
-func writeDistillScript(t *testing.T, a *Agent, name, body string) {
+func writeModelingScript(t *testing.T, a *Agent, name, body string) {
 	t.Helper()
-	dir := filepath.Join(a.reinforcementDir, distillReinforcementName)
+	dir := filepath.Join(a.reinforcementDir, modelingReinforcementName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -370,10 +370,10 @@ func TestStepGivesAgentWrapupChanceAfterMaxIterations(t *testing.T) {
 	}
 	a := newTestAgent(t, prov)
 	a.maxIterations = 1
-	// The wrap-up turn forces a distill firing with $AUTOPROBE_FINAL=1 set,
+	// The wrap-up turn forces a modeling firing with $AUTOPROBE_FINAL=1 set,
 	// so the test script branches on it to emit a marker only on the wrap-up
 	// firing. That way we also check that the final-phase env signal lands.
-	writeDistillScript(t, a, "general.sh",
+	writeModelingScript(t, a, "general.sh",
 		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo WRAPUP-MARKER; fi\n")
 
 	ctx := context.Background()
@@ -442,7 +442,7 @@ func TestStepWrapupAllowsToolCycleToComplete(t *testing.T) {
 }
 
 // usageProvider is a scriptedProvider that also lets the test stamp
-// InputTokens on the replayed responses, which is what the per-Step distill
+// InputTokens on the replayed responses, which is what the per-Step modeling
 // threshold check reads.
 type usageProvider struct {
 	scriptedProvider
@@ -463,7 +463,7 @@ func (p *usageProvider) Generate(ctx context.Context, sysPrompt string, c provid
 
 // lastToolResultText returns the trailing TextContent of the most recent
 // ToolResultMessage in a provider call's input messages — that's where a
-// periodic distill firing lands and what the model will see right before
+// periodic modeling firing lands and what the model will see right before
 // generating its next response.
 func lastToolResultText(t *testing.T, msgs []provider.Message) string {
 	t.Helper()
@@ -475,13 +475,13 @@ func lastToolResultText(t *testing.T, msgs []provider.Message) string {
 	return ""
 }
 
-func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
+func TestStepFiresPeriodicModelingIntoLastToolResult(t *testing.T) {
 	t.Parallel()
-	// Step 1's InputTokens crosses the threshold on its own, so the distill
+	// Step 1's InputTokens crosses the threshold on its own, so the modeling
 	// prompt must be appended to Step 1's tool result — Step 2's input then
 	// carries it at the tail. Step 2 also crosses the threshold but cooldown
 	// suppresses the second firing.
-	bigInput := distillThresholdTokens + 1024
+	bigInput := modelingThresholdTokens + 1024
 	prov := &usageProvider{
 		scriptedProvider: scriptedProvider{
 			responses: []provider.AssistantMessage{
@@ -493,8 +493,8 @@ func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
 		inputTokens: []int{bigInput, bigInput, 1024},
 	}
 	a := newTestAgent(t, prov)
-	writeDistillScript(t, a, "general.sh",
-		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo FINAL-MARKER; else echo DISTILL-MARKER; fi\n")
+	writeModelingScript(t, a, "general.sh",
+		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo FINAL-MARKER; else echo MODELING-MARKER; fi\n")
 
 	runSteps(t, a, 3)
 
@@ -503,10 +503,10 @@ func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
 		t.Fatalf("call 1 unexpectedly already has a tool result: %q", got)
 	}
 	// Call 2 input: should contain the tool result from Step 1 with the
-	// distill prompt appended at its tail.
+	// modeling prompt appended at its tail.
 	got2 := lastToolResultText(t, prov.calls[1].Messages)
-	if !strings.Contains(got2, "DISTILL-MARKER") {
-		t.Fatalf("call 2 last tool result missing distill prompt: %q", got2)
+	if !strings.Contains(got2, "MODELING-MARKER") {
+		t.Fatalf("call 2 last tool result missing modeling prompt: %q", got2)
 	}
 	if strings.Contains(got2, "FINAL-MARKER") {
 		t.Fatalf("call 2 carries FINAL framing but this is a periodic firing: %q", got2)
@@ -514,7 +514,7 @@ func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
 	// Call 3 input: the tool result from Step 2 must NOT carry the prompt —
 	// we are inside the cooldown window even though Step 2 also crossed.
 	got3 := lastToolResultText(t, prov.calls[2].Messages)
-	if strings.Contains(got3, "DISTILL-MARKER") {
+	if strings.Contains(got3, "MODELING-MARKER") {
 		t.Fatalf("call 3 last tool result fired during cooldown: %q", got3)
 	}
 }
@@ -531,7 +531,7 @@ func TestStepRunsFreshInferenceAfterCycleEndsEvenIfProgramsStable(t *testing.T) 
 	prov := &scriptedProvider{
 		responses: []provider.AssistantMessage{
 			{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
-			{Content: []provider.AssistantContent{provider.TextContent{Text: "distilling and yielding"}}, StopReason: provider.StopEnd},
+			{Content: []provider.AssistantContent{provider.TextContent{Text: "modelinging and yielding"}}, StopReason: provider.StopEnd},
 			{Content: []provider.AssistantContent{provider.TextContent{Text: "still done"}}, StopReason: provider.StopEnd},
 		},
 	}
@@ -574,12 +574,12 @@ func TestStepIdlesAfterRepeatedYieldsWithStableHash(t *testing.T) {
 	}
 }
 
-func TestStepClearsDistillCooldownWhenCycleEnds(t *testing.T) {
+func TestStepClearsModelingCooldownWhenCycleEnds(t *testing.T) {
 	t.Parallel()
-	// A cycle that fires the distill prompt and then ends naturally must
+	// A cycle that fires the modeling prompt and then ends naturally must
 	// clear the cooldown — the next cycle starts with a fresh history slate
 	// and should be allowed to fire on its own merits.
-	bigInput := distillThresholdTokens + 1024
+	bigInput := modelingThresholdTokens + 1024
 	prov := &usageProvider{
 		scriptedProvider: scriptedProvider{
 			responses: []provider.AssistantMessage{
@@ -593,7 +593,7 @@ func TestStepClearsDistillCooldownWhenCycleEnds(t *testing.T) {
 
 	runSteps(t, a, 2)
 
-	if a.distillCooldown != 0 {
-		t.Fatalf("distillCooldown should reset to 0 on cycle end, got %d", a.distillCooldown)
+	if a.modelingCooldown != 0 {
+		t.Fatalf("modelingCooldown should reset to 0 on cycle end, got %d", a.modelingCooldown)
 	}
 }

@@ -3,24 +3,24 @@
 ## Implementation status
 
 **Proposed, deferred.** Not yet implemented. To be revisited after
-[dedicated distill turn](dedicated-distill-turn.md) lands and after
+[dedicated modeling turn](dedicated-modeling-turn.md) lands and after
 [signal-driven reinforcement](signal-driven-reinforcement.md) is in place
 (this design reuses the same detectors).
 
 ## Problem
 
-The current distillation reinforcement tells the agent "you should distill"
-in the abstract. Even the targeted variant from
+The current modeling reinforcement tells the agent "you should update
+the model" in the abstract. Even the targeted variant from
 [signal-driven reinforcement](signal-driven-reinforcement.md) only fires
 when the agent crosses a threshold during the current cycle — at which
 point the agent is already mid-flow and has to context-switch.
 
 A complementary approach: make probe-debt *visible in the dashboard* the
 agent sees at the start of every cycle, as a probe like any other. The
-agent doesn't get told "you should distill." It sees, in its own context,
-a clear-eyed accounting of where the previous cycle wasted tokens that a
-probe could have absorbed. The information is just *there*, alongside
-everything else, with no nag attached.
+agent doesn't get told "you should update the model." It sees, in its
+own context, a clear-eyed accounting of where the previous cycle wasted
+tokens that a probe could have absorbed. The information is just
+*there*, alongside everything else, with no nag attached.
 
 This leans into autoprobe's central thesis: knowledge belongs in
 executable programs whose output flows into the context, not in
@@ -88,12 +88,12 @@ The implicit version is preferable — it's self-validating. If the agent
 *thought* it captured the repetition but the work cycle still re-reads
 the file, the line stays in the report and the gap is visible.
 
-### Interaction with the dedicated distill turn
+### Interaction with the dedicated modeling turn
 
-The probe-debt meta-probe is one of the inputs the dedicated distill
-turn sees. The distill turn's framing changes meaningfully when this
+The probe-debt meta-probe is one of the inputs the dedicated modeling
+turn sees. The modeling turn's framing changes meaningfully when this
 probe is in the dashboard: "here are the gaps the agent itself can see;
-your job is to close some of them." The distill turn becomes
+your job is to close some of them." The modeling turn becomes
 goal-directed in a way that's hard to achieve when the goal is "review
 the cycle and decide what's worth capturing" in the abstract.
 
@@ -116,11 +116,11 @@ within budget even under the [context budget](context-budget.md) rules.
   resolved? Probably resolved — the cheap heuristic is "report debt
   from the most recent cycle only," and let the agent decide if it
   wants to write a probe for something that has not recurred recently.
-- **What if the prior cycle was a [distill
-  turn](dedicated-distill-turn.md)?** The meta-probe should look back
-  past distill turns to the most recent work cycle — distill turns
+- **What if the prior cycle was a [modeling
+  turn](dedicated-modeling-turn.md)?** The meta-probe should look back
+  past modeling turns to the most recent work cycle — modeling turns
   don't accumulate user-task debt, so reporting on them is
-  meaningless. This is one of the reasons distill turns should be
+  meaningless. This is one of the reasons modeling turns should be
   tagged distinctly in the trace.
 - **False positives from intentional re-reads.** Sometimes re-reading
   the same file *is* the right move (e.g., the file changed between

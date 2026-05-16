@@ -12,7 +12,7 @@ import (
 	"github.com/comnik/autoprobe/internal/provider"
 )
 
-// How long a transient visual flash (DISTILL badge, library "changed"
+// How long a transient visual flash (MODELING badge, library "changed"
 // pulse) holds after the triggering event before fading back to the
 // resting style.
 const flashDuration = 2 * time.Second
@@ -323,26 +323,26 @@ func (m tuiModel) budgetState() barState {
 func (m tuiModel) dragState() barState {
 	drag, valid := m.agent.LastDrag()
 	flashing := false
-	if t := m.agent.LastDistillFiredAt(); !t.IsZero() && time.Since(t) <= flashDuration {
+	if t := m.agent.LastModelingFiredAt(); !t.IsZero() && time.Since(t) <= flashDuration {
 		flashing = true
 	}
 	if !valid {
 		annotation := "—"
 		if flashing {
-			annotation = flashStyle.Render("DISTILL") + "  " + annotation
+			annotation = flashStyle.Render("MODELING") + "  " + annotation
 		}
 		return barState{pct: 0, fill: barEmpty, annotation: annotation}
 	}
-	pct := float64(drag) / float64(distillThresholdTokens)
+	pct := float64(drag) / float64(modelingThresholdTokens)
 	style := barFillGreen
 	if pct >= 1.0 {
 		style = barFillRed
 	} else if pct >= 0.8 {
 		style = barFillAmber
 	}
-	annotation := fmt.Sprintf("%d%%   %s / %s tok", clampPct(pct), humanInt(drag), humanInt(distillThresholdTokens))
+	annotation := fmt.Sprintf("%d%%   %s / %s tok", clampPct(pct), humanInt(drag), humanInt(modelingThresholdTokens))
 	if flashing {
-		annotation = flashStyle.Render("DISTILL") + "  " + annotation
+		annotation = flashStyle.Render("MODELING") + "  " + annotation
 	}
 	return barState{pct: pct, fill: style, annotation: annotation}
 }

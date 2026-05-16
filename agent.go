@@ -50,29 +50,29 @@ const (
 	revisionReinforcementName = "revision"
 
 	// Pseudo-tool name under reinforcement/ whose scripts emit the
-	// distillation prompt — a nudge for the agent to compress what it has
+	// modeling prompt — a nudge for the agent to compress what it has
 	// learned during a tool-use cycle into a program. Fires when a Step's
-	// in-cycle drag crosses distillThresholdTokens, and is forced on the
+	// in-cycle drag crosses modelingThresholdTokens, and is forced on the
 	// wrap-up turn when -n is exhausted (with $AUTOPROBE_FINAL=1 set so the
 	// script can emit last-chance framing).
-	distillReinforcementName = "distill"
+	modelingReinforcementName = "modeling"
 
 	// Inside a tool-use cycle, the non-program portion of an inference's
 	// input (InputTokens − the program-output portion of the user message)
 	// is what the model is paying to drag prior history forward. When that
-	// crosses this threshold on a single Step, the distill prompt is appended
+	// crosses this threshold on a single Step, the modeling prompt is appended
 	// to that Step's last tool result so the model sees the nudge attached
 	// to what it is reacting to. The threshold doubles as the working-set
 	// alarm: ≈16 pages (2K each) of in-cycle drag is enough that compressing
 	// to a program saves more on every subsequent inference than the
 	// compression itself costs.
-	distillThresholdTokens = 32 * 1024
+	modelingThresholdTokens = 32 * 1024
 
-	// Steps to wait after a periodic distill firing before considering the
+	// Steps to wait after a periodic modeling firing before considering the
 	// next one. Without this, once history exceeds the threshold every
 	// subsequent Step would re-fire, since the per-Step drag stays above the
 	// threshold until the model actually ends the cycle.
-	distillCooldownSteps = 5
+	modelingCooldownSteps = 5
 )
 
 func NewAgent(prov provider.Provider, root, goal string, maxIterations int) *Agent {
@@ -131,7 +131,7 @@ type Agent struct {
 
 	// finalPhase flips true on the first substantive Step that hits the -n cap
 	// and stays true for the remainder of the run. While set, Step skips idle
-	// backoff and forces a distill firing on the next user message (with
+	// backoff and forces a modeling firing on the next user message (with
 	// $AUTOPROBE_FINAL=1 so the prompt can carry last-chance framing). The
 	// run terminates once the model returns a non-tool-use stop reason on
 	// (or after) entering this phase.
@@ -142,7 +142,7 @@ type Agent struct {
 	// check is suppressed. Zeroed on cycle end. The wrap-up firing bypasses
 	// cooldown because it goes through the user-message path, not the
 	// tool-result path.
-	distillCooldown int
+	modelingCooldown int
 
 	// prevOutputs is a session-local buffer of each program's last-
 	// iteration output, used to compute change frequency, change amount,
@@ -175,7 +175,7 @@ type Agent struct {
 	lastProgramTokens atomic.Int64
 	lastDrag          atomic.Int64
 	inToolCycle       atomic.Bool
-	distillFiredAtNs  atomic.Int64
+	modelingFiredAtNs  atomic.Int64
 
 	snapshotMu   sync.Mutex
 	lastSnapshot []ProgramSnapshot
@@ -255,11 +255,11 @@ func (a *Agent) LastDrag() (drag int, valid bool) {
 	return int(a.lastDrag.Load()), a.inToolCycle.Load()
 }
 
-// LastDistillFiredAt returns the wall-clock time of the most recent
-// distill firing, or the zero time if none has fired yet. The TUI uses
+// LastModelingFiredAt returns the wall-clock time of the most recent
+// modeling firing, or the zero time if none has fired yet. The TUI uses
 // the recency to drive the bar flash.
-func (a *Agent) LastDistillFiredAt() time.Time {
-	n := a.distillFiredAtNs.Load()
+func (a *Agent) LastModelingFiredAt() time.Time {
+	n := a.modelingFiredAtNs.Load()
 	if n == 0 {
 		return time.Time{}
 	}
@@ -358,7 +358,7 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		}
 
 		showPrompt = a.advanceOverflowStreak(fresh.overflowed(a.contextBudget))
-		// The wrap-up turn force-shows the distill prompt in the user
+		// The wrap-up turn force-shows the modeling prompt in the user
 		// message (no tool result is available to attach to — the cycle
 		// just ended). Periodic firings inside a tool-use cycle land in
 		// the last tool result instead, so this is the only path that
@@ -372,7 +372,7 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		a.lastProgramTokens.Store(int64(fresh.totalTokens))
 		a.refreshSnapshot(fresh, userMsg)
 		if a.finalPhase {
-			a.distillFiredAtNs.Store(time.Now().UnixNano())
+			a.modelingFiredAtNs.Store(time.Now().UnixNano())
 		}
 		break
 	}
@@ -454,46 +454,46 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		}
 	}
 
-	// Working-set alarm for periodic distillation. Inside a tool-use cycle,
+	// Working-set alarm for periodic modeling. Inside a tool-use cycle,
 	// InputTokens − the program-output portion of the user message
 	// approximates how much prior history this inference is dragging
-	// forward. When that exceeds distillThresholdTokens on a single Step,
-	// append the distill prompt to the last tool result so the model sees
+	// forward. When that exceeds modelingThresholdTokens on a single Step,
+	// append the modeling prompt to the last tool result so the model sees
 	// it right before its next response. The cooldown then suppresses
 	// further firings — once history is large, every subsequent inference
 	// would re-cross the threshold and nag every turn. The cycle ending
 	// (msg.StopReason != StopToolUse) clears the cooldown because the
 	// history is about to be wiped.
-	distillFired := false
+	modelingFired := false
 	if msg.StopReason == provider.StopToolUse {
-		if a.distillCooldown > 0 {
-			a.distillCooldown--
+		if a.modelingCooldown > 0 {
+			a.modelingCooldown--
 		} else {
 			drag := msg.Usage.InputTokens - data.totalTokens
-			if drag >= distillThresholdTokens && len(toolResults) > 0 {
-				if text := a.runReinforcementPrompt(distillReinforcementName); text != "" {
+			if drag >= modelingThresholdTokens && len(toolResults) > 0 {
+				if text := a.runReinforcementPrompt(modelingReinforcementName); text != "" {
 					last := &toolResults[len(toolResults)-1]
 					last.Content = append(last.Content, provider.TextContent{Text: text})
-					distillFired = true
-					a.distillFiredAtNs.Store(time.Now().UnixNano())
+					modelingFired = true
+					a.modelingFiredAtNs.Store(time.Now().UnixNano())
 				}
-				a.distillCooldown = distillCooldownSteps
+				a.modelingCooldown = modelingCooldownSteps
 			}
 		}
 	} else {
-		a.distillCooldown = 0
+		a.modelingCooldown = 0
 	}
 
 	for _, tr := range toolResults {
 		a.conversation = append(a.conversation, tr)
 	}
 
-	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt, distillFired || a.finalPhase)
+	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt, modelingFired || a.finalPhase)
 
 	// Terminate once the wrap-up turn (and any tool cycle it kicked off) has
 	// fully resolved. The wrap-up turn itself runs on the Step *after* we
 	// hit -n: this turn ends the cycle and arms finalPhase, the next Step
-	// sees finalPhase=true and forces a distill firing, and the Step after
+	// sees finalPhase=true and forces a modeling firing, and the Step after
 	// that returns done=true once the model stops calling tools.
 	done := false
 	if a.finalPhase {
@@ -518,7 +518,7 @@ func (a *Agent) writeTrace(
 	data iterationData,
 	userMsg provider.UserMessage,
 	revisionFired bool,
-	distillFired bool,
+	modelingFired bool,
 ) {
 	if a.tracer == nil {
 		return
@@ -544,7 +544,7 @@ func (a *Agent) writeTrace(
 			UsedTokens:              data.totalTokens,
 			Overflowed:              data.overflowed(a.contextBudget),
 			RevisionPromptFired:     revisionFired,
-			DistillPromptFired:      distillFired,
+			ModelingPromptFired:      modelingFired,
 			ActiveBudgetTokens:      activeBudget,
 			ExplorationBudgetTokens: a.contextBudget - activeBudget,
 		},
@@ -1037,10 +1037,10 @@ func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt, finalPh
 			contents = append(contents, provider.TextContent{Text: text})
 		}
 	}
-	// Wrap-up turn forces a distill firing in the user message — there is no
+	// Wrap-up turn forces a modeling firing in the user message — there is no
 	// tool result to attach to because the cycle just ended.
 	if finalPhase {
-		if text := a.runReinforcementPrompt(distillReinforcementName, "AUTOPROBE_FINAL=1"); text != "" {
+		if text := a.runReinforcementPrompt(modelingReinforcementName, "AUTOPROBE_FINAL=1"); text != "" {
 			contents = append(contents, provider.TextContent{Text: text})
 		}
 	}
