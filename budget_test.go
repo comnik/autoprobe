@@ -61,7 +61,7 @@ func renderUserMessage(t *testing.T, a *Agent) string {
 	if err != nil {
 		t.Fatalf("runIteration: %v", err)
 	}
-	return provider.JoinText(a.assembleUserMessage(data, false, false, false).Content)
+	return provider.JoinText(a.assembleUserMessage(data, false, false).Content)
 }
 
 func TestHashResultsFlipsWhenExitCodeChanges(t *testing.T) {
@@ -390,7 +390,7 @@ func TestAssembleUserMessageAppendsRevisionPromptAtTail(t *testing.T) {
 		t.Fatalf("test setup did not produce overflow")
 	}
 
-	msg := a.assembleUserMessage(data, true, false, false)
+	msg := a.assembleUserMessage(data, true, false)
 	if len(msg.Content) == 0 {
 		t.Fatal("assembled message is empty")
 	}
@@ -417,7 +417,7 @@ func TestAssembleUserMessageOmitsRevisionPromptWhenScriptMissing(t *testing.T) {
 		t.Fatalf("runIteration: %v", err)
 	}
 
-	msg := a.assembleUserMessage(data, true, false, false)
+	msg := a.assembleUserMessage(data, true, false)
 	for _, c := range msg.Content {
 		if strings.Contains(c.Text, "[REVISION]") {
 			t.Fatalf("revision prompt was emitted despite missing script: %q", c.Text)
@@ -470,7 +470,7 @@ func renderData(a *Agent, results []programResult, inactive map[string]struct{},
 	for _, r := range results {
 		d.totalTokens += r.renderedTokens()
 	}
-	return provider.JoinText(a.assembleUserMessage(d, showPrompt, false, false).Content)
+	return provider.JoinText(a.assembleUserMessage(d, showPrompt, false).Content)
 }
 
 func TestAssembleUserMessageFitsKeepsLexOrder(t *testing.T) {
@@ -517,7 +517,7 @@ func TestActiveSlotPackedInLexOrderDropsLateNames(t *testing.T) {
 	if !d.overflowed(a.contextBudget) {
 		t.Fatalf("setup did not overflow (total=%d budget=%d)", d.totalTokens, a.contextBudget)
 	}
-	text := provider.JoinText(a.assembleUserMessage(d, false, false, false).Content)
+	text := provider.JoinText(a.assembleUserMessage(d, false, false).Content)
 	aaaHdr := strings.Index(text, "[program=aaa exit=0]")
 	mmmHdr := strings.Index(text, "[program=mmm exit=0]")
 	zzzDrop := strings.Index(text, "[program=zzz dropped:")
@@ -557,7 +557,7 @@ func TestActiveAlarmKeepsLexPositionUnderOverflow(t *testing.T) {
 	if !d.overflowed(a.contextBudget) {
 		t.Fatalf("setup did not overflow (total=%d budget=%d)", d.totalTokens, a.contextBudget)
 	}
-	text := provider.JoinText(a.assembleUserMessage(d, false, false, false).Content)
+	text := provider.JoinText(a.assembleUserMessage(d, false, false).Content)
 	aaa := strings.Index(text, "[program=aaa exit=0]")
 	mmm := strings.Index(text, "[program=mmm exit=7]")
 	zzz := strings.Index(text, "[program=zzz exit=0]")

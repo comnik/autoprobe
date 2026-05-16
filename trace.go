@@ -139,6 +139,7 @@ type iterationLogEntry struct {
 	StopReason          string    `json:"stop_reason"`
 	Overflowed          bool      `json:"overflowed"`
 	RevisionPromptFired bool      `json:"revision_prompt_fired"`
+	DistillPromptFired  bool      `json:"distill_prompt_fired"`
 	IdlePollsBefore     int       `json:"idle_polls_before"`
 	InputTokens         int       `json:"input_tokens"`
 	OutputTokens        int       `json:"output_tokens"`
@@ -263,6 +264,7 @@ func (t *Tracer) WriteIteration(rec IterationTrace) error {
 		StopReason:          rec.Response.StopReason,
 		Overflowed:          rec.Budget.Overflowed,
 		RevisionPromptFired: rec.Budget.RevisionPromptFired,
+		DistillPromptFired:  rec.Budget.DistillPromptFired,
 		IdlePollsBefore:     rec.IdlePollsBefore,
 		InputTokens:         rec.Response.Usage.InputTokens,
 		OutputTokens:        rec.Response.Usage.OutputTokens,

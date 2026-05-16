@@ -2,9 +2,10 @@
 # Reinforcement that nudges the agent to distill what it has learned during
 # the current tool-use cycle into an executable program in $PROGRAMS_DIR.
 # Fires periodically once cumulative in-cycle input tokens cross a threshold
-# (see distillThresholdTokens in agent.go) and once unconditionally on the
-# wrap-up turn after -n is exhausted. The wrap-up firing sets
-# $AUTOPROBE_FINAL=1 so we can switch to last-chance framing.
+# (see distillThresholdTokens in agent.go) by appending to the last tool
+# result, and once unconditionally on the wrap-up turn after -n is exhausted
+# via the leading user message. The wrap-up firing sets $AUTOPROBE_FINAL=1
+# so we can switch to last-chance framing.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -34,22 +35,23 @@ fi
 
 cat <<EOF
 [DISTILL]
-You have spent a meaningful amount of context this tool-use cycle re-reading
-prior results into your input. The conversation history is ephemeral — it
-will be wiped when this cycle ends — so anything not committed to a program
-is about to be lost.
+You have accumulated significant in-cycle context this tool-use cycle. The
+conversation history is ephemeral — it will be wiped when this cycle ends,
+so anything not committed to a program in $PROGRAMS_DIR is about to be lost.
 
-$PROGRAMS_DIR is your only persistent memory. Before continuing, compress
-what you have learned this cycle into a program there:
+Now is the right moment to:
+  1. Write or update a program in $PROGRAMS_DIR that captures what you have
+     learned so far this cycle — a reading you keep re-fetching becomes a
+     program that prints the compact summary; a check you keep running
+     becomes a program that exits non-zero when the assumption is violated;
+     a computation you keep doing in tokens becomes a program that does it
+     in bytes.
+  2. END this tool-use cycle: after writing, respond with a brief plain-text
+     summary and NO further tool calls. The next iteration will start fresh
+     with your updated programs contributing their output to context — and
+     you will be able to attack the next sub-problem from a clean slate
+     instead of dragging this cycle's history forward.
 
-- A reading you keep re-fetching → a program that reads it once and prints
-  the compact summary you actually use.
-- A check you keep running ad hoc → a program that runs it deterministically
-  and exits non-zero when the assumption is violated.
-- A computation the model is doing in tokens → a program that does it in
-  bytes, so the next iteration can read the answer instead of re-deriving it.
-
-The buffer-manager rule: a page (≈2K tokens) carried for many iterations
-costs more cumulatively than the program that subsumes it. If you are
-dragging the same content forward, write the program now.
+Continuing to call tools here makes every subsequent inference re-pay for
+the history you have accumulated. Compress and yield.
 EOF

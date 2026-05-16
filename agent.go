@@ -51,21 +51,28 @@ const (
 
 	// Pseudo-tool name under reinforcement/ whose scripts emit the
 	// distillation prompt — a nudge for the agent to compress what it has
-	// learned during a tool-use cycle into a program. Fires periodically
-	// based on cycleInputTokenDebt and is forced on the wrap-up turn when -n
-	// is exhausted (with $AUTOPROBE_FINAL=1 set so the script can emit
-	// last-chance framing).
+	// learned during a tool-use cycle into a program. Fires when a Step's
+	// in-cycle drag crosses distillThresholdTokens, and is forced on the
+	// wrap-up turn when -n is exhausted (with $AUTOPROBE_FINAL=1 set so the
+	// script can emit last-chance framing).
 	distillReinforcementName = "distill"
 
-	// Within a tool-use cycle, history accumulates and is re-billed on every
-	// subsequent inference. We track the cumulative non-program input tokens
-	// (InputTokens − the program-output portion of the user message) as a
-	// proxy for "page-iterations dragged." When the running total crosses
-	// this threshold the next user message carries a distill prompt and the
-	// counter is decremented by the threshold so firings stay periodic.
-	// 32K ≈ 16 pages × 1 iteration ≈ 4 pages × 4 iterations of drag, picked
-	// to fire on cycles long enough that compression should pay off.
+	// Inside a tool-use cycle, the non-program portion of an inference's
+	// input (InputTokens − the program-output portion of the user message)
+	// is what the model is paying to drag prior history forward. When that
+	// crosses this threshold on a single Step, the distill prompt is appended
+	// to that Step's last tool result so the model sees the nudge attached
+	// to what it is reacting to. The threshold doubles as the working-set
+	// alarm: ≈16 pages (2K each) of in-cycle drag is enough that compressing
+	// to a program saves more on every subsequent inference than the
+	// compression itself costs.
 	distillThresholdTokens = 32 * 1024
+
+	// Steps to wait after a periodic distill firing before considering the
+	// next one. Without this, once history exceeds the threshold every
+	// subsequent Step would re-fire, since the per-Step drag stays above the
+	// threshold until the model actually ends the cycle.
+	distillCooldownSteps = 5
 )
 
 func NewAgent(prov provider.Provider, root, goal string, debug bool, maxIterations int) *Agent {
@@ -123,17 +130,12 @@ type Agent struct {
 	// (or after) entering this phase.
 	finalPhase bool
 
-	// Cumulative non-program input tokens billed since the current tool-use
-	// cycle began. Reset to zero whenever a Step returns !StopToolUse (the
-	// cycle's history is about to be wiped, so there is nothing to compress).
-	// When this exceeds distillThresholdTokens the next user message carries
-	// the distill prompt and the counter is decremented by the threshold.
-	cycleInputTokenDebt int
-	// distillPending is the latch between "debt crossed threshold this Step"
-	// and "next user message carries the distill prompt." A single bool is
-	// enough because we decrement debt by the threshold on firing, so a
-	// second-firing-in-one-Step can't happen.
-	distillPending bool
+	// Steps remaining in the post-firing cooldown. Decremented at the end of
+	// each Step inside a tool-use cycle; while > 0 the per-Step threshold
+	// check is suppressed. Zeroed on cycle end. The wrap-up firing bypasses
+	// cooldown because it goes through the user-message path, not the
+	// tool-result path.
+	distillCooldown int
 
 	// prevOutputs is a session-local buffer of each program's last-
 	// iteration output, used to compute change frequency, change amount,
@@ -204,7 +206,6 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		data            iterationData
 		userMsg         provider.UserMessage
 		showPrompt      bool
-		showDistill     bool
 		idlePollsBefore int
 		idleWait        time.Duration
 	)
@@ -248,14 +249,12 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		}
 
 		showPrompt = a.advanceOverflowStreak(fresh.overflowed(a.contextBudget))
-		// The wrap-up turn forces a distill firing; periodic firings are
-		// armed at the end of the prior Step via cycleInputTokenDebt.
-		if a.finalPhase {
-			a.distillPending = true
-		}
-		showDistill = a.distillPending
-		a.distillPending = false
-		userMsg = a.assembleUserMessage(fresh, showPrompt, showDistill, a.finalPhase)
+		// The wrap-up turn force-shows the distill prompt in the user
+		// message (no tool result is available to attach to — the cycle
+		// just ended). Periodic firings inside a tool-use cycle land in
+		// the last tool result instead, so this is the only path that
+		// uses the user-message slot.
+		userMsg = a.assembleUserMessage(fresh, showPrompt, a.finalPhase)
 		a.conversation = append([]provider.Message{userMsg}, history...)
 		a.idleBackoff = 0
 		a.idlePollsInFlight.Store(0)
@@ -309,34 +308,44 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 	var toolResults []provider.ToolResultMessage
 	for _, c := range msg.Content {
 		if call, ok := c.(provider.ToolCall); ok {
-			tr := a.executeTool(call)
-			a.conversation = append(a.conversation, tr)
-			toolResults = append(toolResults, tr)
+			toolResults = append(toolResults, a.executeTool(call))
 		}
 	}
 
-	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt, showDistill)
-
-	// Buffer-manager accounting for periodic distillation. Inside a tool-use
-	// cycle the history is re-billed every inference, so InputTokens minus
-	// the program-output portion of the user message approximates the
-	// page-iterations dragged this Step. We accumulate that and, when it
-	// crosses distillThresholdTokens, arm a distill firing for the next
-	// user message. The cycle ending (msg.StopReason != StopToolUse) clears
-	// the debt because the history is about to be wiped — there is nothing
-	// left to compress next turn.
+	// Working-set alarm for periodic distillation. Inside a tool-use cycle,
+	// InputTokens − the program-output portion of the user message
+	// approximates how much prior history this inference is dragging
+	// forward. When that exceeds distillThresholdTokens on a single Step,
+	// append the distill prompt to the last tool result so the model sees
+	// it right before its next response. The cooldown then suppresses
+	// further firings — once history is large, every subsequent inference
+	// would re-cross the threshold and nag every turn. The cycle ending
+	// (msg.StopReason != StopToolUse) clears the cooldown because the
+	// history is about to be wiped.
+	distillFired := false
 	if msg.StopReason == provider.StopToolUse {
-		drag := msg.Usage.InputTokens - data.totalTokens
-		if drag > 0 {
-			a.cycleInputTokenDebt += drag
-		}
-		if a.cycleInputTokenDebt >= distillThresholdTokens {
-			a.distillPending = true
-			a.cycleInputTokenDebt -= distillThresholdTokens
+		if a.distillCooldown > 0 {
+			a.distillCooldown--
+		} else {
+			drag := msg.Usage.InputTokens - data.totalTokens
+			if drag >= distillThresholdTokens && len(toolResults) > 0 {
+				if text := a.runReinforcementPrompt(distillReinforcementName); text != "" {
+					last := &toolResults[len(toolResults)-1]
+					last.Content = append(last.Content, provider.TextContent{Text: text})
+					distillFired = true
+				}
+				a.distillCooldown = distillCooldownSteps
+			}
 		}
 	} else {
-		a.cycleInputTokenDebt = 0
+		a.distillCooldown = 0
 	}
+
+	for _, tr := range toolResults {
+		a.conversation = append(a.conversation, tr)
+	}
+
+	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt, distillFired || a.finalPhase)
 
 	// Terminate once the wrap-up turn (and any tool cycle it kicked off) has
 	// fully resolved. The wrap-up turn itself runs on the Step *after* we
@@ -754,7 +763,7 @@ func (a *Agent) buildConversation(ctx context.Context) ([]provider.Message, erro
 	if err != nil {
 		return nil, err
 	}
-	return []provider.Message{a.assembleUserMessage(data, false, false, false)}, nil
+	return []provider.Message{a.assembleUserMessage(data, false, false)}, nil
 }
 
 // iterationData bundles one iteration's worth of program execution: the
@@ -806,7 +815,7 @@ func (a *Agent) runIteration(ctx context.Context) (iterationData, error) {
 // programs) and the exploration slot (non-zero-exit inactives lex-ordered
 // first, then a uniform random draw from zero-exit inactives). The goal
 // and revision prompt land at the tail of the context.
-func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt, showDistillPrompt, finalPhase bool) provider.UserMessage {
+func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt, finalPhase bool) provider.UserMessage {
 	var contents []provider.TextContent
 
 	if !d.overflowed(a.contextBudget) {
@@ -831,12 +840,10 @@ func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt, showDis
 			contents = append(contents, provider.TextContent{Text: text})
 		}
 	}
-	if showDistillPrompt {
-		var env []string
-		if finalPhase {
-			env = []string{"AUTOPROBE_FINAL=1"}
-		}
-		if text := a.runReinforcementPrompt(distillReinforcementName, env...); text != "" {
+	// Wrap-up turn forces a distill firing in the user message — there is no
+	// tool result to attach to because the cycle just ended.
+	if finalPhase {
+		if text := a.runReinforcementPrompt(distillReinforcementName, "AUTOPROBE_FINAL=1"); text != "" {
 			contents = append(contents, provider.TextContent{Text: text})
 		}
 	}

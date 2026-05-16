@@ -442,8 +442,8 @@ func TestStepWrapupAllowsToolCycleToComplete(t *testing.T) {
 }
 
 // usageProvider is a scriptedProvider that also lets the test stamp
-// InputTokens on the replayed responses, which is what cycleInputTokenDebt
-// reads to decide when to fire a periodic distill.
+// InputTokens on the replayed responses, which is what the per-Step distill
+// threshold check reads.
 type usageProvider struct {
 	scriptedProvider
 	inputTokens []int // parallel to responses
@@ -461,13 +461,26 @@ func (p *usageProvider) Generate(ctx context.Context, sysPrompt string, c provid
 	return msg, nil
 }
 
-func TestStepFiresPeriodicDistillWhenCycleDebtCrossesThreshold(t *testing.T) {
+// lastToolResultText returns the trailing TextContent of the most recent
+// ToolResultMessage in a provider call's input messages — that's where a
+// periodic distill firing lands and what the model will see right before
+// generating its next response.
+func lastToolResultText(t *testing.T, msgs []provider.Message) string {
+	t.Helper()
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if tr, ok := msgs[i].(provider.ToolResultMessage); ok {
+			return provider.JoinText(tr.Content)
+		}
+	}
+	return ""
+}
+
+func TestStepFiresPeriodicDistillIntoLastToolResult(t *testing.T) {
 	t.Parallel()
-	// Three tool-use Steps with InputTokens above the threshold each. The
-	// first Step accumulates debt that crosses the threshold, so Step 2's
-	// user message must carry the distill prompt. The third Step (still
-	// mid-cycle) should NOT carry it again because debt was decremented by
-	// the threshold on firing and hasn't crossed again yet.
+	// Step 1's InputTokens crosses the threshold on its own, so the distill
+	// prompt must be appended to Step 1's tool result — Step 2's input then
+	// carries it at the tail. Step 2 also crosses the threshold but cooldown
+	// suppresses the second firing.
 	bigInput := distillThresholdTokens + 1024
 	prov := &usageProvider{
 		scriptedProvider: scriptedProvider{
@@ -477,64 +490,55 @@ func TestStepFiresPeriodicDistillWhenCycleDebtCrossesThreshold(t *testing.T) {
 				{Content: []provider.AssistantContent{provider.TextContent{Text: "ok"}}, StopReason: provider.StopEnd},
 			},
 		},
-		inputTokens: []int{bigInput, 1024, 1024},
+		inputTokens: []int{bigInput, bigInput, 1024},
 	}
 	a := newTestAgent(t, prov)
 	writeDistillScript(t, a, "general.sh",
 		"#!/bin/sh\nif [ \"$AUTOPROBE_FINAL\" = \"1\" ]; then echo FINAL-MARKER; else echo DISTILL-MARKER; fi\n")
 
-	ctx := context.Background()
 	runSteps(t, a, 3)
 
-	if got := len(prov.calls); got != 3 {
-		t.Fatalf("provider call count: got %d, want 3", got)
+	// Call 1 input: just the user message — no tool result yet.
+	if got := lastToolResultText(t, prov.calls[0].Messages); got != "" {
+		t.Fatalf("call 1 unexpectedly already has a tool result: %q", got)
 	}
-	// Call 1: pre-firing — no distill marker.
-	u0, _ := prov.calls[0].Messages[0].(provider.UserMessage)
-	if got := provider.JoinText(u0.Content); strings.Contains(got, "DISTILL-MARKER") {
-		t.Fatalf("call 1 unexpectedly carries distill prompt: %q", got)
+	// Call 2 input: should contain the tool result from Step 1 with the
+	// distill prompt appended at its tail.
+	got2 := lastToolResultText(t, prov.calls[1].Messages)
+	if !strings.Contains(got2, "DISTILL-MARKER") {
+		t.Fatalf("call 2 last tool result missing distill prompt: %q", got2)
 	}
-	// Call 2: armed by Step 1's debt accumulation — distill marker present,
-	// FINAL marker absent (this is a periodic firing, not the wrap-up turn).
-	u1, _ := prov.calls[1].Messages[0].(provider.UserMessage)
-	text1 := provider.JoinText(u1.Content)
-	if !strings.Contains(text1, "DISTILL-MARKER") {
-		t.Fatalf("call 2 missing distill prompt: %q", text1)
+	if strings.Contains(got2, "FINAL-MARKER") {
+		t.Fatalf("call 2 carries FINAL framing but this is a periodic firing: %q", got2)
 	}
-	if strings.Contains(text1, "FINAL-MARKER") {
-		t.Fatalf("call 2 carries FINAL framing but this is a periodic firing, not wrap-up: %q", text1)
+	// Call 3 input: the tool result from Step 2 must NOT carry the prompt —
+	// we are inside the cooldown window even though Step 2 also crossed.
+	got3 := lastToolResultText(t, prov.calls[2].Messages)
+	if strings.Contains(got3, "DISTILL-MARKER") {
+		t.Fatalf("call 3 last tool result fired during cooldown: %q", got3)
 	}
-	// Call 3: distillPending was cleared on call 2, debt hasn't crossed
-	// threshold again — no firing this Step.
-	u2, _ := prov.calls[2].Messages[0].(provider.UserMessage)
-	if got := provider.JoinText(u2.Content); strings.Contains(got, "DISTILL-MARKER") {
-		t.Fatalf("call 3 unexpectedly re-fires distill: %q", got)
-	}
-	_ = ctx
 }
 
-func TestStepClearsCycleDebtWhenCycleEnds(t *testing.T) {
+func TestStepClearsDistillCooldownWhenCycleEnds(t *testing.T) {
 	t.Parallel()
-	// A cycle that ends with StopEnd before the threshold is crossed must
-	// reset the debt — the conversation history is wiped on cycle end, so
-	// there is nothing left to distill on the next turn.
+	// A cycle that fires the distill prompt and then ends naturally must
+	// clear the cooldown — the next cycle starts with a fresh history slate
+	// and should be allowed to fire on its own merits.
+	bigInput := distillThresholdTokens + 1024
 	prov := &usageProvider{
 		scriptedProvider: scriptedProvider{
 			responses: []provider.AssistantMessage{
-				{Content: []provider.AssistantContent{provider.TextContent{Text: "done"}}, StopReason: provider.StopEnd},
+				{Content: []provider.AssistantContent{bashToolCall("c1", "true")}, StopReason: provider.StopToolUse},
 				{Content: []provider.AssistantContent{provider.TextContent{Text: "done"}}, StopReason: provider.StopEnd},
 			},
 		},
-		inputTokens: []int{distillThresholdTokens - 100, 100},
+		inputTokens: []int{bigInput, 100},
 	}
 	a := newTestAgent(t, prov)
 
 	runSteps(t, a, 2)
 
-	if a.cycleInputTokenDebt != 0 {
-		t.Fatalf("cycleInputTokenDebt should reset to 0 on cycle end, got %d", a.cycleInputTokenDebt)
-	}
-	if a.distillPending {
-		t.Fatalf("distillPending should be false when threshold was never crossed")
+	if a.distillCooldown != 0 {
+		t.Fatalf("distillCooldown should reset to 0 on cycle end, got %d", a.distillCooldown)
 	}
 }
