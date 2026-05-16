@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
-# Refresh autoprobe to HEAD on the `autoprobe-programbench` sprite, stage a
-# fresh copy of the task workspace, and run autoprobe against it.
+# Restore the `autoprobe-programbench` sprite to its eval-ready checkpoint,
+# refresh autoprobe to HEAD, and run autoprobe as the unprivileged `runner`
+# user against the pristine workspace.
 #
-# Assumes the sprite has already been provisioned by evals/setup-sprite.sh.
+# Assumes the sprite has been provisioned by evals/setup-sprite.sh, which
+# captures the eval-ready state (runner user, /usr/local/bin/autoprobe, sealed
+# workspace at /home/sprite/programbench) as a sprite checkpoint.
 # Requires ANTHROPIC_API_KEY in the local environment.
 set -euo pipefail
 
 SPRITE_NAME="autoprobe-programbench"
+# TASK_ID / TASK_IMAGE are consumed by setup-sprite.sh; here for traceability
+# and to drive the grading step at the end of this script.
 TASK_ID="abishekvashok__cmatrix.5c082c6"
 TASK_IMAGE="programbench/abishekvashok_1776_cmatrix.5c082c6:task_cleanroom"
 WORKSPACE="/home/sprite/programbench/workspace"
 MODEL="claude-opus-4-7"
-ITERATIONS=100
+ITERATIONS=50
 
 if ! command -v sprite >/dev/null 2>&1; then
   echo "error: sprite CLI not found in PATH" >&2
@@ -23,6 +28,24 @@ if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
   exit 1
 fi
 
+echo "==> Restoring sprite to eval-ready checkpoint"
+# `sprite restore` replaces the writable overlay with the captured state,
+# resetting everything we'd otherwise have to clean by hand: workspace, runner
+# home, /tmp /var/tmp /dev/shm, leftover runner processes. setup-sprite.sh
+# leaves exactly one checkpoint behind, so the newest vN line is unambiguous.
+CHECKPOINT=$(sprite checkpoint list -s "${SPRITE_NAME}" | awk '/^v[0-9]+/ {print $1; exit}')
+if [[ -z "${CHECKPOINT}" ]]; then
+  echo "error: no checkpoint on ${SPRITE_NAME} — run evals/setup-sprite.sh first" >&2
+  exit 1
+fi
+sprite restore -s "${SPRITE_NAME}" "${CHECKPOINT}"
+echo "    waiting for sprite to come back online..."
+for _ in $(seq 1 60); do
+  sprite exec -s "${SPRITE_NAME}" -- true 2>/dev/null && break
+  sleep 1
+done
+sprite exec -s "${SPRITE_NAME}" -- true
+
 echo "==> Refreshing autoprobe to HEAD"
 sprite exec -s "${SPRITE_NAME}" -- bash -lc '
   set -euo pipefail
@@ -33,55 +56,19 @@ sprite exec -s "${SPRITE_NAME}" -- bash -lc '
   sudo install -m 0755 "$(go env GOPATH)/bin/autoprobe" /usr/local/bin/autoprobe
 '
 
-echo "==> Ensuring dockerd is running"
-sprite exec -s "${SPRITE_NAME}" -- bash -lc '
-  set -euo pipefail
-  if ! sudo docker info >/dev/null 2>&1; then
-    sudo setsid sh -c "nohup dockerd >/tmp/dockerd.log 2>&1 &" </dev/null
-    for _ in $(seq 1 30); do
-      sudo docker info >/dev/null 2>&1 && break
-      sleep 1
-    done
-    sudo docker info >/dev/null
-  fi
-'
-
-echo "==> Refreshing task workspace at ${WORKSPACE}"
-# Re-export the task image's rootfs into a fresh /home/sprite/programbench.
-# Workspace contents are owned by `runner` so the unprivileged agent can edit
-# them, but the sealed ./executable is left root-owned with mode ---x--x--x:
-# runner can run it, but cannot read or chmod it.
-sprite exec -s "${SPRITE_NAME}" --env TASK_IMAGE="${TASK_IMAGE}" -- bash -lc '
-  set -euo pipefail
-  sudo rm -rf "$HOME/programbench"
-  mkdir -p "$HOME/programbench"
-  cid=$(sudo docker create "$TASK_IMAGE")
-  trap "sudo docker rm -f \"$cid\" >/dev/null 2>&1 || true" EXIT
-  sudo docker export "$cid" | sudo tar -x -C "$HOME/programbench"
-  sudo chown -R runner:runner "$HOME/programbench"
-  sudo chown root:root "$HOME/programbench/workspace/executable"
-  sudo chmod 0111 "$HOME/programbench/workspace/executable"
-'
-
 read -r -d "" GOAL <<EOF || true
-You are running on a sprite host. The reverse-engineering target is staged
-at:
+There is a binary plus documentation and related materials in the ${WORKSPACE} directory.
 
-    ${WORKSPACE}
+Treat this binary as a black box and model its behaviour accurately and exhaustively.
 
-Operate directly in that directory.
-
-Your task:
-
-- Explore: Run the ./executable binary in ${WORKSPACE} with various flags
-  (e.g. ./executable --help, ./executable -v) to reverse-engineer its
-  behavior.
-- Read: Examine README.md and any other documentation files there.
-- Implement: Write the source code in a language of your choice (C, Rust,
-  Go, etc.) into ${WORKSPACE}.
-- Build: Create a build.sh script in ${WORKSPACE} that compiles the source
-  into an executable named "candidate" in the same directory.
+Don't access the internet, don't try to look up the source code.
 EOF
+
+# NOTE leaving this out as an experiment
+# Your goal is to exactly reimplement the functionality of this binary in a language of your choice, without access to the original source code.
+# Create a compile.sh script in ${WORKSPACE} that, when run with cwd=${WORKSPACE}, produces a working binary at ${WORKSPACE}/executable
+# (overwriting the sealed one). The grader will wipe the workspace, extract your submission, chmod +x compile.sh, and run ./compile.sh — so anything
+# needed at compile time must live in the workspace.
 
 echo "==> Running autoprobe as runner (${MODEL}, n=${ITERATIONS})"
 # sprite user (has sudo) hands off to runner (no sudo, not in docker group).
@@ -92,7 +79,7 @@ sprite exec --tty -s "${SPRITE_NAME}" \
   --env ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}",MODEL="${MODEL}",GOAL="${GOAL}",ITERATIONS="${ITERATIONS}",WORKSPACE="${WORKSPACE}" \
   -- bash -lc '
   set -euo pipefail
-  exec sudo -n -u runner env \
+  sudo -n -u runner env \
     ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
     MODEL="$MODEL" \
     GOAL="$GOAL" \
@@ -104,4 +91,42 @@ sprite exec --tty -s "${SPRITE_NAME}" \
       autoprobe init --provider anthropic --model "$MODEL"
       autoprobe run -n "$ITERATIONS" --goal "$GOAL"
     '\''
+'
+
+echo "==> Grading candidate against oracle"
+# The checkpoint has dockerd stopped; programbench eval spins up per-branch
+# containers, so we need it running for the grade step. Then we tar up the
+# agent-edited workspace (minus its own scratch + the sealed original exe)
+# into the layout `programbench eval` expects: <run_dir>/<instance_id>/submission.tar.gz.
+sprite exec --tty -s "${SPRITE_NAME}" \
+  --env TASK_ID="${TASK_ID}",WORKSPACE="${WORKSPACE}" \
+  -- bash -lc '
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$PATH"
+
+  if ! sudo docker info >/dev/null 2>&1; then
+    sudo setsid sh -c "nohup dockerd >/tmp/dockerd.log 2>&1 &" </dev/null
+    for _ in $(seq 1 30); do
+      sudo docker info >/dev/null 2>&1 && break
+      sleep 1
+    done
+    sudo docker info >/dev/null
+  fi
+
+  RUN_OUT="$HOME/eval-runs/$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$RUN_OUT/$TASK_ID"
+  # Workspace is runner-owned; sudo needed to read the entire tree including
+  # the agent-written files. Exclude agent scratch and the sealed original
+  # executable (the grader runs the agent_s compile.sh to produce a fresh one).
+  sudo tar -czf "$RUN_OUT/$TASK_ID/submission.tar.gz" \
+    --exclude=./.autoprobe \
+    --exclude=./.autoprobe-last-run \
+    --exclude=./executable \
+    -C "$WORKSPACE" .
+  sudo chown -R "$(id -un):$(id -gn)" "$RUN_OUT"
+  echo "submission archive: $RUN_OUT/$TASK_ID/submission.tar.gz"
+  ls -la "$RUN_OUT/$TASK_ID/submission.tar.gz"
+
+  uvx programbench eval "$RUN_OUT"
+  uvx programbench info "$RUN_OUT"
 '

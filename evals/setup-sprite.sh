@@ -61,17 +61,29 @@ sprite exec -s "${SPRITE_NAME}" -- bash -lc '
   sudo install -m 0755 "$(go env GOPATH)/bin/autoprobe" /usr/local/bin/autoprobe
 '
 
-echo "==> Staging programbench task '${TASK_ID}' into ~/programbench"
-sprite exec -s "${SPRITE_NAME}" --env TASK_ID="${TASK_ID}",TASK_IMAGE="${TASK_IMAGE}" -- bash -lc '
+echo "==> Staging eval-ready workspace at ~/programbench"
+# Pull just /workspace out of the task image (not the whole rootfs — that
+# trips over symlinks like usr/lib64 -> usr/lib). The checkpoint we create
+# at the end of this script captures this state; run-eval.sh restores to it
+# so the workspace is pristine on every run with no docker calls at run time.
+# Workspace contents are owned by `runner` so the unprivileged agent can
+# write there; the sealed ./executable stays root-owned mode ---x--x--x.
+sprite exec -s "${SPRITE_NAME}" --env TASK_IMAGE="${TASK_IMAGE}" -- bash -lc '
   set -euo pipefail
-  rm -rf "$HOME/programbench"
-  mkdir -p "$HOME/programbench"
+  sudo rm -rf "$HOME/programbench"
+  sudo mkdir -p "$HOME/programbench"
   sudo docker pull "$TASK_IMAGE"
   cid=$(sudo docker create "$TASK_IMAGE")
   trap "sudo docker rm -f \"$cid\" >/dev/null 2>&1 || true" EXIT
-  sudo docker export "$cid" | sudo tar -x -C "$HOME/programbench"
-  sudo chown -R "$(id -un):$(id -gn)" "$HOME/programbench"
+  sudo docker cp "$cid":/workspace "$HOME/programbench/workspace"
+  sudo chown -R runner:runner "$HOME/programbench"
+  sudo chown root:root "$HOME/programbench/workspace/executable"
+  sudo chmod 0111 "$HOME/programbench/workspace/executable"
+'
 
+echo "==> Syncing programbench task blobs"
+sprite exec -s "${SPRITE_NAME}" --env TASK_ID="${TASK_ID}" -- bash -lc '
+  set -euo pipefail
   if ! command -v uvx >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
