@@ -75,7 +75,7 @@ const (
 	distillCooldownSteps = 5
 )
 
-func NewAgent(prov provider.Provider, root, goal string, debug bool, maxIterations int) *Agent {
+func NewAgent(prov provider.Provider, root, goal string, maxIterations int) *Agent {
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
@@ -86,12 +86,20 @@ func NewAgent(prov provider.Provider, root, goal string, debug bool, maxIteratio
 		reinforcementDir: filepath.Join(root, "reinforcement"),
 		goal:             goal,
 		tools:            DefaultTools,
-		debug:            debug,
 		contextBudget:    defaultContextBudgetTokens,
 		maxIterations:    maxIterations,
 		prevOutputs:      map[string][]byte{},
 	}
 }
+
+// Phase values describe what Step is currently doing. Read by the TUI to
+// drive the phase-indicator strip; written by Step at each transition.
+const (
+	PhaseIdle uint32 = iota
+	PhaseRunPrograms
+	PhaseInference
+	PhaseTools
+)
 
 type Agent struct {
 	provider         provider.Provider
@@ -100,7 +108,6 @@ type Agent struct {
 	reinforcementDir string
 	goal             string
 	tools            []ToolDefinition
-	debug            bool
 	contextBudget    int // token ceiling for the program-output slot
 	maxIterations    int // exit after this many runIteration calls; 0 = unlimited
 	tracer           *Tracer
@@ -154,6 +161,36 @@ type Agent struct {
 	// idleStartedAtNs == 0 means "not currently idling".
 	idlePollsInFlight atomic.Int32
 	idleStartedAtNs   atomic.Int64
+
+	// Dashboard vitals. Atomics so the TUI can read them at any tick
+	// without locking against Step. phaseChangedCh, when set by the TUI
+	// via SubscribePhaseChanges, gets a non-blocking nudge whenever phase
+	// transitions so the indicator updates without waiting for the next
+	// 1s tick.
+	phase             atomic.Uint32
+	phaseChangedCh    chan struct{}
+	totalInputTokens  atomic.Int64
+	totalOutputTokens atomic.Int64
+	toolCycles        atomic.Int64
+	lastProgramTokens atomic.Int64
+	lastDrag          atomic.Int64
+	inToolCycle       atomic.Bool
+	distillFiredAtNs  atomic.Int64
+
+	snapshotMu   sync.Mutex
+	lastSnapshot []ProgramSnapshot
+}
+
+// ProgramSnapshot is one program's state in the most recent iteration —
+// exposed to the TUI so the library bar can render width, color, and
+// active/included flags without poking at internal agent slices.
+type ProgramSnapshot struct {
+	Name              string
+	RenderedTokens    int
+	Active            bool
+	IncludedInContext bool
+	Dropped           bool // sentinel emitted in place of the rendered output
+	ChangedThisIter   bool
 }
 
 // IdleStatus reports whether Step is currently sitting in its idle-poll
@@ -169,9 +206,79 @@ func (a *Agent) IdleStatus() (polls int, since time.Duration, active bool) {
 
 func (a *Agent) Conversation() []provider.Message { return a.conversation }
 func (a *Agent) Iteration() int                   { return a.iteration }
-func (a *Agent) StepThrough() bool                { return a.debug }
 func (a *Agent) Provider() provider.Provider      { return a.provider }
 func (a *Agent) ContextBudget() int               { return a.contextBudget }
+
+// Phase reports the current step phase. Atomically updated by Step so the
+// TUI can render the phase-indicator strip from any goroutine.
+func (a *Agent) Phase() uint32 { return a.phase.Load() }
+
+// SubscribePhaseChanges returns a channel that receives a non-blocking
+// nudge on every phase transition. Replaces any previous subscription;
+// the TUI is the sole subscriber.
+func (a *Agent) SubscribePhaseChanges() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	a.phaseChangedCh = ch
+	return ch
+}
+
+func (a *Agent) setPhase(p uint32) {
+	if a.phase.Swap(p) == p {
+		return
+	}
+	if ch := a.phaseChangedCh; ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// TotalTokens returns cumulative provider-reported input/output tokens
+// across every Step in this run.
+func (a *Agent) TotalTokens() (in, out int) {
+	return int(a.totalInputTokens.Load()), int(a.totalOutputTokens.Load())
+}
+
+// ToolCycles returns the number of completed tool-calling cycles
+// (continuous runs of StopToolUse steps that ended on a non-tool stop).
+func (a *Agent) ToolCycles() int { return int(a.toolCycles.Load()) }
+
+// LastProgramTokens returns the totalTokens of the most recent
+// substantive iteration's assembled program output.
+func (a *Agent) LastProgramTokens() int { return int(a.lastProgramTokens.Load()) }
+
+// LastDrag returns the most recent Step's in-cycle drag (input tokens
+// minus program-output tokens). valid is true only when the most recent
+// Step ended mid tool-use cycle — outside a cycle the value is undefined.
+func (a *Agent) LastDrag() (drag int, valid bool) {
+	return int(a.lastDrag.Load()), a.inToolCycle.Load()
+}
+
+// LastDistillFiredAt returns the wall-clock time of the most recent
+// distill firing, or the zero time if none has fired yet. The TUI uses
+// the recency to drive the bar flash.
+func (a *Agent) LastDistillFiredAt() time.Time {
+	n := a.distillFiredAtNs.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+// LastProgramSnapshot returns a copy of the per-program state from the
+// most recent substantive iteration. Safe to call from any goroutine;
+// the returned slice is independent of agent state.
+func (a *Agent) LastProgramSnapshot() []ProgramSnapshot {
+	a.snapshotMu.Lock()
+	defer a.snapshotMu.Unlock()
+	if len(a.lastSnapshot) == 0 {
+		return nil
+	}
+	out := make([]ProgramSnapshot, len(a.lastSnapshot))
+	copy(out, a.lastSnapshot)
+	return out
+}
 
 // SetTracer attaches a run tracer. Trace writes are best-effort; a nil
 // tracer disables tracing entirely. Setter rather than constructor arg so
@@ -215,6 +322,7 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 			history = append(history, a.conversation[1:]...)
 		}
 
+		a.setPhase(PhaseRunPrograms)
 		fresh, err := a.runIteration(ctx)
 		if err != nil {
 			return provider.AssistantMessage{}, false, err
@@ -235,6 +343,7 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 					a.idleStartedAtNs.Store(time.Now().UnixNano())
 				}
 				a.idlePollsInFlight.Add(1)
+				a.setPhase(PhaseIdle)
 				select {
 				case <-time.After(d):
 					idlePollsBefore++
@@ -260,6 +369,11 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		a.idlePollsInFlight.Store(0)
 		a.idleStartedAtNs.Store(0)
 		data = fresh
+		a.lastProgramTokens.Store(int64(fresh.totalTokens))
+		a.refreshSnapshot(fresh, userMsg)
+		if a.finalPhase {
+			a.distillFiredAtNs.Store(time.Now().UnixNano())
+		}
 		break
 	}
 
@@ -273,10 +387,13 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 		Messages: contextMsgs,
 		Tools:    a.toolSchemas(),
 	}
+	a.setPhase(PhaseInference)
 	msg, err := a.provider.Generate(ctx, "", c, provider.Options{MaxTokens: 8192})
 	if err != nil {
 		return provider.AssistantMessage{}, false, err
 	}
+	a.totalInputTokens.Add(int64(msg.Usage.InputTokens))
+	a.totalOutputTokens.Add(int64(msg.Usage.OutputTokens))
 	if msg.StopReason == provider.StopError {
 		return msg, false, fmt.Errorf("provider error: %s", msg.Err)
 	}
@@ -312,10 +429,25 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 	} else {
 		a.lastOutputHash = data.hash
 	}
+	prevStopReason := a.lastStopReason
 	a.lastStopReason = msg.StopReason
 	a.conversation = append(a.conversation, msg)
 
+	if msg.StopReason == provider.StopToolUse {
+		a.lastDrag.Store(int64(msg.Usage.InputTokens - data.totalTokens))
+		a.inToolCycle.Store(true)
+	} else {
+		a.lastDrag.Store(0)
+		a.inToolCycle.Store(false)
+		if prevStopReason == provider.StopToolUse {
+			a.toolCycles.Add(1)
+		}
+	}
+
 	var toolResults []provider.ToolResultMessage
+	if hasToolCall(msg.Content) {
+		a.setPhase(PhaseTools)
+	}
 	for _, c := range msg.Content {
 		if call, ok := c.(provider.ToolCall); ok {
 			toolResults = append(toolResults, a.executeTool(call))
@@ -343,6 +475,7 @@ func (a *Agent) Step(ctx context.Context) (provider.AssistantMessage, bool, erro
 					last := &toolResults[len(toolResults)-1]
 					last.Content = append(last.Content, provider.TextContent{Text: text})
 					distillFired = true
+					a.distillFiredAtNs.Store(time.Now().UnixNano())
 				}
 				a.distillCooldown = distillCooldownSteps
 			}
@@ -513,6 +646,60 @@ func (a *Agent) updateOneStat(r programResult, respTri map[[3]string]struct{}) {
 	}
 	s.Samples++
 	_ = saveStatsFor(a.root, r.name, s)
+}
+
+// refreshSnapshot rebuilds the per-program snapshot the TUI reads via
+// LastProgramSnapshot. Called once per substantive iteration, right after
+// assembleUserMessage so the inclusion check reflects what was actually
+// packed into the user message (rendered vs sentinel). prevOutputs is read
+// under prevMu but not modified — updateStats overwrites it later in the
+// same Step, after Generate returns.
+func (a *Agent) refreshSnapshot(d iterationData, userMsg provider.UserMessage) {
+	const renderedPrefix = "[program="
+	included := map[string]int{} // 1 = rendered, 2 = sentinel
+	for _, c := range userMsg.Content {
+		s := c.Text
+		if !strings.HasPrefix(s, renderedPrefix) {
+			continue
+		}
+		rest := s[len(renderedPrefix):]
+		end := strings.IndexAny(rest, " ]")
+		if end < 0 {
+			continue
+		}
+		name := rest[:end]
+		// Sentinels write "[program=NAME dropped: ...]"; rendered output
+		// writes "[program=NAME exit=N]\n...". Distinguish on the bytes
+		// immediately after the name token.
+		after := rest[end:]
+		if strings.HasPrefix(after, " dropped:") {
+			included[name] = 2
+		} else {
+			included[name] = 1
+		}
+	}
+
+	a.prevMu.Lock()
+	defer a.prevMu.Unlock()
+	snap := make([]ProgramSnapshot, 0, len(d.results))
+	for _, r := range d.results {
+		_, inactive := d.inactive[r.name]
+		prev, hasPrev := a.prevOutputs[r.name]
+		changed := hasPrev && !bytes.Equal(prev, r.output)
+		kind := included[r.name]
+		snap = append(snap, ProgramSnapshot{
+			Name:              r.name,
+			RenderedTokens:    r.renderedTokens(),
+			Active:            !inactive,
+			IncludedInContext: kind == 1,
+			Dropped:           kind == 2,
+			ChangedThisIter:   changed,
+		})
+	}
+
+	a.snapshotMu.Lock()
+	a.lastSnapshot = snap
+	a.snapshotMu.Unlock()
 }
 
 // advanceOverflowStreak updates the consecutive-overflow counter and reports

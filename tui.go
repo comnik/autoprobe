@@ -2,11 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -14,32 +13,47 @@ import (
 )
 
 const (
-	maxMsgHeight  = 20
+	// maxLineLength caps the rendered dashboard width. Wider than this is
+	// wasted screen real estate — the panels are dense but narrow.
 	maxLineLength = 92
+
+	// Lines reserved for the assistant-message panel. Holds even when the
+	// message would be longer (trailing lines are truncated with an
+	// ellipsis) so the dashboard height stays constant.
+	assistantPanelLines = 8
+
+	// How long a transient visual flash (DISTILL badge, library "changed"
+	// pulse) holds after the triggering event before fading back to the
+	// resting style.
+	flashDuration = 2 * time.Second
 )
 
 type tuiState int
 
 const (
 	stateInit tuiState = iota
-	stateReady
 	stateRunning
 	stateDone
 	stateError
 )
 
 type tuiModel struct {
-	agent        *Agent
-	ctx          context.Context
-	state        tuiState
-	stepThrough  bool
-	err          error
-	width        int
-	height       int
-	msgViewports []viewport.Model
-	activeIdx    int
-	outerVp      viewport.Model
-	ready        bool
+	agent   *Agent
+	ctx     context.Context
+	state   tuiState
+	err     error
+	width   int
+	height  int
+	ready   bool
+	phaseCh <-chan struct{}
+
+	// pulsedAtIter tracks the most recent iteration at which the library
+	// bar flashed each program's segment, so the pulse is single-tick:
+	// the segment goes bright the first time we observe a change for an
+	// iteration and settles back to its resting style on the next
+	// refresh. The agent's snapshot would otherwise re-assert
+	// ChangedThisIter on every tick within the same iteration.
+	pulsedAtIter map[string]int
 }
 
 type primedMsg struct{ err error }
@@ -49,21 +63,40 @@ type stepMsg struct {
 	err  error
 }
 
+type tickMsg struct{}
+type phaseMsg struct{}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
 func runTUI(ctx context.Context, agent *Agent) error {
 	m := tuiModel{
-		agent:       agent,
-		ctx:         ctx,
-		state:       stateInit,
-		stepThrough: agent.StepThrough(),
+		agent:        agent,
+		ctx:          ctx,
+		state:        stateInit,
+		pulsedAtIter: map[string]int{},
+		phaseCh:      agent.SubscribePhaseChanges(),
 	}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
 
 func (m tuiModel) Init() tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			err := m.agent.Prime(m.ctx)
+			return primedMsg{err: err}
+		},
+		tickCmd(),
+		waitPhase(m.phaseCh),
+	)
+}
+
+func waitPhase(ch <-chan struct{}) tea.Cmd {
 	return func() tea.Msg {
-		err := m.agent.Prime(m.ctx)
-		return primedMsg{err: err}
+		<-ch
+		return phaseMsg{}
 	}
 }
 
@@ -80,493 +113,530 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ready = true
-		m.refreshContent()
 		return m, nil
 
 	case primedMsg:
 		if msg.err != nil {
 			m.err = msg.err
 			m.state = stateError
-			m.refreshContent()
 			return m, nil
 		}
-		var cmd tea.Cmd
-		m.state, cmd = m.advance()
-		m.refreshContent()
-		return m, cmd
+		m.state = stateRunning
+		return m, m.step()
+
+	case tickMsg:
+		return m, tickCmd()
+
+	case phaseMsg:
+		return m, waitPhase(m.phaseCh)
 
 	case stepMsg:
 		if msg.err != nil {
 			m.err = msg.err
 			m.state = stateError
-			m.refreshContent()
 			return m, nil
 		}
 		if msg.done {
 			m.state = stateDone
-			m.refreshContent()
 			return m, nil
 		}
-		var cmd tea.Cmd
-		m.state, cmd = m.advance()
-		m.refreshContent()
-		return m, cmd
+		return m, m.step()
 
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "s":
-			m.stepThrough = !m.stepThrough
-			if !m.stepThrough && m.state == stateReady {
-				m.state = stateRunning
-				m.refreshContent()
-				return m, m.step()
-			}
-			m.refreshContent()
-			return m, nil
-		case "tab":
-			if len(m.msgViewports) > 0 {
-				m.activeIdx = (m.activeIdx + 1) % len(m.msgViewports)
-				m.refreshContent()
-				m.scrollOuterToActive()
-			}
-			return m, nil
-		case "shift+tab":
-			if len(m.msgViewports) > 0 {
-				m.activeIdx = (m.activeIdx - 1 + len(m.msgViewports)) % len(m.msgViewports)
-				m.refreshContent()
-				m.scrollOuterToActive()
-			}
-			return m, nil
 		case "enter", " ":
-			switch m.state {
-			case stateReady:
-				m.state = stateRunning
-				m.refreshContent()
-				return m, m.step()
-			case stateDone, stateError:
+			if m.state == stateDone || m.state == stateError {
 				return m, tea.Quit
 			}
 		}
-		var cmd tea.Cmd
-		m.outerVp, cmd = m.outerVp.Update(msg)
-		return m, cmd
 	}
-
-	var cmd tea.Cmd
-	m.outerVp, cmd = m.outerVp.Update(msg)
-	return m, cmd
-}
-
-// advance picks the next state after a successful prime/step. In step-through
-// mode we wait for the user; otherwise we keep firing iterations.
-func (m tuiModel) advance() (tuiState, tea.Cmd) {
-	if m.stepThrough {
-		return stateReady, nil
-	}
-	return stateRunning, m.step()
+	return m, nil
 }
 
 func (m tuiModel) contentWidth() int {
-	w := m.width - 2
+	w := m.width
 	if w > maxLineLength {
 		w = maxLineLength
 	}
-	if w < 1 {
-		w = 1
+	if w < 20 {
+		w = 20
 	}
 	return w
-}
-
-// blockEntry is one renderable unit in the conversation: either a content
-// piece of an assistant message (text/thinking/toolCall), a piece of a user
-// message (text), or a tool result.
-type blockEntry struct {
-	role provider.Role
-
-	// At most one of these is non-nil.
-	userText   *provider.TextContent
-	asstText   *provider.TextContent
-	thinking   *provider.ThinkingContent
-	toolCall   *provider.ToolCall
-	toolResult *provider.ToolResultMessage
-}
-
-func (e blockEntry) isAssistantText() bool { return e.asstText != nil }
-func (e blockEntry) isUserText() bool      { return e.userText != nil }
-
-func collectBlocks(conversation []provider.Message) []blockEntry {
-	var entries []blockEntry
-	for _, msg := range conversation {
-		switch m := msg.(type) {
-		case provider.UserMessage:
-			for i := range m.Content {
-				c := m.Content[i]
-				entries = append(entries, blockEntry{role: provider.RoleUser, userText: &c})
-			}
-		case provider.AssistantMessage:
-			for _, c := range m.Content {
-				switch c := c.(type) {
-				case provider.TextContent:
-					t := c
-					entries = append(entries, blockEntry{role: provider.RoleAssistant, asstText: &t})
-				case provider.ThinkingContent:
-					th := c
-					entries = append(entries, blockEntry{role: provider.RoleAssistant, thinking: &th})
-				case provider.ToolCall:
-					tc := c
-					entries = append(entries, blockEntry{role: provider.RoleAssistant, toolCall: &tc})
-				}
-			}
-		case provider.ToolResultMessage:
-			tr := m
-			entries = append(entries, blockEntry{role: provider.RoleToolResult, toolResult: &tr})
-		}
-	}
-	return entries
-}
-
-// findLatestAssistantText returns the index of the most recent assistant text
-// block in entries, or -1 if none. That block is pinned at the bottom of the
-// TUI so the model's most recent narration stays visible.
-func findLatestAssistantText(entries []blockEntry) int {
-	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].isAssistantText() {
-			return i
-		}
-	}
-	return -1
-}
-
-func (m *tuiModel) refreshContent() {
-	if !m.ready {
-		return
-	}
-	entries := collectBlocks(m.agent.Conversation())
-	cw := m.contentWidth()
-
-	prevLen := len(m.msgViewports)
-	// "Following" means the user hasn't tabbed away from the most recent block.
-	// In that case we keep advancing the selection (and scrolling to bottom) as
-	// new blocks arrive. If they've tab-selected an earlier block we leave them
-	// there.
-	following := prevLen == 0 || m.activeIdx == prevLen-1
-	for i := prevLen; i < len(entries); i++ {
-		m.msgViewports = append(m.msgViewports, viewport.New(cw, 1))
-	}
-
-	for i, entry := range entries {
-		body := renderBlock(entry, cw)
-		h := lipgloss.Height(body)
-		// Inactive blocks cap at maxMsgHeight; the active block expands so the
-		// user can see every line.
-		if i != m.activeIdx && h > maxMsgHeight {
-			h = maxMsgHeight
-		}
-		if h < 1 {
-			h = 1
-		}
-		m.msgViewports[i].Width = cw
-		m.msgViewports[i].Height = h
-		m.msgViewports[i].SetContent(body)
-		m.msgViewports[i].GotoBottom()
-	}
-
-	if following && len(m.msgViewports) > prevLen {
-		m.activeIdx = len(m.msgViewports) - 1
-	}
-	if m.activeIdx >= len(m.msgViewports) {
-		m.activeIdx = 0
-	}
-
-	m.refreshOuter()
-	if following && len(m.msgViewports) > prevLen {
-		m.outerVp.GotoBottom()
-	}
-}
-
-// refreshOuter rebuilds the outer viewport's content + dimensions from the
-// current per-block viewports, while preserving the user's scroll position.
-func (m *tuiModel) refreshOuter() {
-	if !m.ready {
-		return
-	}
-	entries := collectBlocks(m.agent.Conversation())
-	pinnedIdx := findLatestAssistantText(entries)
-
-	headerH := 1
-	footerH := 2
-	pinnedH := 0
-	if pinnedIdx >= 0 && pinnedIdx < len(m.msgViewports) {
-		// separator + header line + viewport body
-		pinnedH = 2 + m.msgViewports[pinnedIdx].Height
-	}
-	outerH := m.height - headerH - footerH - pinnedH
-	if outerH < 1 {
-		outerH = 1
-	}
-
-	cw := m.contentWidth()
-	m.outerVp.Width = cw
-	m.outerVp.Height = outerH
-
-	yOffset := m.outerVp.YOffset
-	content, _ := m.buildOuterContent(entries, pinnedIdx)
-	m.outerVp.SetContent(content)
-	m.outerVp.SetYOffset(yOffset)
-}
-
-// scrollOuterToActive scrolls the outer viewport so that the active block's
-// separator becomes the top visible line. No-op when the active block is
-// pinned (it's always visible) or when activeIdx is out of range.
-func (m *tuiModel) scrollOuterToActive() {
-	if !m.ready {
-		return
-	}
-	entries := collectBlocks(m.agent.Conversation())
-	pinnedIdx := findLatestAssistantText(entries)
-	if m.activeIdx == pinnedIdx {
-		return
-	}
-	_, activeLine := m.buildOuterContent(entries, pinnedIdx)
-	if activeLine < 0 {
-		return
-	}
-	m.outerVp.SetYOffset(activeLine)
-}
-
-// buildOuterContent renders the scrollable region (everything except pinned)
-// and returns both the rendered string and the 0-indexed line offset where
-// the active block's separator starts (or -1 if the active block is pinned
-// or out of range).
-func (m tuiModel) buildOuterContent(entries []blockEntry, pinnedIdx int) (string, int) {
-	var b strings.Builder
-	cw := m.contentWidth()
-	first := true
-	activeLine := -1
-	for i, entry := range entries {
-		if i == pinnedIdx {
-			continue
-		}
-		if !first {
-			b.WriteString("\n")
-		}
-		first = false
-		if i == m.activeIdx {
-			activeLine = lipgloss.Height(b.String()) - 1
-		}
-		b.WriteString(m.blockSeparator(i, cw))
-		b.WriteString("\n")
-		b.WriteString(m.renderBlockHeader(i, entry))
-		b.WriteString("\n")
-		b.WriteString(m.msgViewports[i].View())
-	}
-	return b.String(), activeLine
-}
-
-func (m tuiModel) blockSeparator(i, width int) string {
-	style := separatorStyle
-	if i == m.activeIdx {
-		style = activeSeparatorStyle
-	}
-	return style.Render(strings.Repeat("─", width))
 }
 
 func (m tuiModel) View() string {
 	if !m.ready {
 		return "initializing…"
 	}
-	sections := []string{m.renderHeader()}
+	cw := m.contentWidth()
 
-	entries := collectBlocks(m.agent.Conversation())
-	if len(entries) == 0 {
-		sections = append(sections, headerInfoStyle.Render("(no messages yet)"))
-	} else {
-		sections = append(sections, m.outerVp.View())
-
-		pinnedIdx := findLatestAssistantText(entries)
-		if pinnedIdx >= 0 && pinnedIdx < len(m.msgViewports) {
-			cw := m.contentWidth()
-			sections = append(sections, m.blockSeparator(pinnedIdx, cw))
-			sections = append(sections, m.renderBlockHeader(pinnedIdx, entries[pinnedIdx]))
-			sections = append(sections, m.msgViewports[pinnedIdx].View())
-		}
+	bars := m.renderBars(cw)
+	sections := []string{
+		m.renderHeader(cw),
+		m.renderPhase(cw),
+		strings.Repeat("─", cw),
+		m.renderTokens(cw),
+		bars,
+		strings.Repeat("─", cw),
+		m.renderAssistant(cw),
+		strings.Repeat("─", cw),
+		m.renderFooter(cw),
 	}
-
-	sections = append(sections, m.renderFooter())
 	return strings.Join(sections, "\n")
 }
 
-var (
-	headerTitleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
-	headerInfoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	headerErrStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	footerStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	footerKeyStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-	activeSeparatorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-	scrollInfoStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+// renderBars renders the budget, drag, and library bars stacked, sharing
+// a common annotation slot so all three bars line up to the same width.
+func (m tuiModel) renderBars(width int) string {
+	budget := m.budgetState()
+	drag := m.dragState()
+	lib := m.libraryState()
 
-	roleAsstStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-	blockHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	userTextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	asstTextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("16"))
-	toolUseStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
-	toolNameStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("84"))
-	toolOkStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
-	toolErrStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	thinkingStyle    = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("141"))
-	separatorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	slot := lipgloss.Width(budget.annotation)
+	if w := lipgloss.Width(drag.annotation); w > slot {
+		slot = w
+	}
+	if w := lipgloss.Width(lib.annotation); w > slot {
+		slot = w
+	}
+
+	rows := []string{
+		m.renderBar(width, "budget", budget.pct, budget.fill, budget.annotation, slot, 0.8),
+		m.renderBar(width, "drag", drag.pct, drag.fill, drag.annotation, slot, -1),
+		m.renderLibraryBar(width, lib, slot),
+	}
+	return strings.Join(rows, "\n")
+}
+
+type barState struct {
+	pct        float64
+	fill       lipgloss.Style
+	annotation string
+}
+
+var (
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
+	infoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	footerKey    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	footerLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	asstStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	pipOnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
+	pipOffStyle  = mutedStyle
+	pipLabel     = infoStyle
+	barFillGreen = lipgloss.NewStyle().Foreground(lipgloss.Color("84"))
+	barFillAmber = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	barFillRed   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	barEmpty     = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	flashStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+
+	// Library segments alternate through this palette so adjacent
+	// active programs are visually distinguishable even when their
+	// segments are all "active, unchanged". Hand-picked greens with
+	// enough hop between neighbors to read as separate bands.
+	librarySegmentPalette = []lipgloss.Style{
+		lipgloss.NewStyle().Foreground(lipgloss.Color("84")),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("35")),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("78")),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("42")),
+	}
 )
 
-func (m tuiModel) renderHeader() string {
-	title := headerTitleStyle.Render("autoprobe v" + Version)
-	info := fmt.Sprintf("iteration %d  •  %s  •  %s", m.agent.Iteration(), m.agent.Provider().Name(), m.stateLabel())
-	style := headerInfoStyle
-	if m.state == stateError {
-		style = headerErrStyle
+func (m tuiModel) renderHeader(width int) string {
+	title := titleStyle.Render("autoprobe v" + Version)
+	model := m.agent.Provider().DefaultModel()
+	cycles := m.agent.ToolCycles()
+	idle := ""
+	if polls, since, active := m.agent.IdleStatus(); active {
+		idle = fmt.Sprintf("  idle: %d polls, %s", polls, since.Truncate(time.Second))
 	}
-	return title + "  " + style.Render(info)
+	right := infoStyle.Render(fmt.Sprintf("model: %s   cycles: %d%s", model, cycles, idle))
+	line := title + "   " + right
+	if m.state == stateError && m.err != nil {
+		return line + "\n" + errStyle.Render("error: "+m.err.Error())
+	}
+	return line
 }
 
-func (m tuiModel) stateLabel() string {
-	switch m.state {
-	case stateInit:
-		return "priming…"
-	case stateReady:
-		return "paused (press enter to step)"
-	case stateRunning:
-		return "running…"
-	case stateDone:
-		return "done"
-	case stateError:
-		if m.err != nil {
-			return "error: " + m.err.Error()
+func (m tuiModel) renderPhase(width int) string {
+	cur := m.agent.Phase()
+	type pip struct {
+		val   uint32
+		label string
+	}
+	pips := []pip{
+		{PhaseRunPrograms, "running programs"},
+		{PhaseInference, "inference"},
+		{PhaseTools, "tools"},
+		{PhaseIdle, "idle"},
+	}
+	var parts []string
+	for _, p := range pips {
+		mark := "○"
+		style := pipOffStyle
+		if p.val == cur {
+			mark = "●"
+			style = pipOnStyle
 		}
-		return "error"
+		parts = append(parts, style.Render(mark)+" "+pipLabel.Render(p.label))
 	}
-	return ""
+	return strings.Join(parts, "   ")
 }
 
-func (m tuiModel) renderBlockHeader(i int, entry blockEntry) string {
-	var label string
+func (m tuiModel) renderTokens(width int) string {
+	in, out := m.agent.TotalTokens()
+	tokensCell := fmt.Sprintf("tokens   %s in  /  %s out", humanInt(in), humanInt(out))
+	costCell := "est. cost   —"
+	if p, ok := lookupPrice(m.agent.Provider().Name(), m.agent.Provider().DefaultModel()); ok {
+		costCell = fmt.Sprintf("est. cost   $%.4f", estimateCost(p, in, out))
+	}
+	// Right-align the cost cell at the panel width.
+	pad := width - lipgloss.Width(tokensCell) - lipgloss.Width(costCell)
+	if pad < 1 {
+		pad = 1
+	}
+	return infoStyle.Render(tokensCell) + strings.Repeat(" ", pad) + infoStyle.Render(costCell)
+}
+
+func (m tuiModel) budgetState() barState {
+	used := m.agent.LastProgramTokens()
+	budget := m.agent.ContextBudget()
+	pct := 0.0
+	if budget > 0 {
+		pct = float64(used) / float64(budget)
+	}
+	style := barFillGreen
+	if pct >= 1.0 {
+		style = barFillRed
+	} else if pct >= 0.8 {
+		style = barFillAmber
+	}
+	return barState{
+		pct:        pct,
+		fill:       style,
+		annotation: fmt.Sprintf("%d%%   %s / %s tok", clampPct(pct), humanInt(used), humanInt(budget)),
+	}
+}
+
+func (m tuiModel) dragState() barState {
+	drag, valid := m.agent.LastDrag()
+	flashing := false
+	if t := m.agent.LastDistillFiredAt(); !t.IsZero() && time.Since(t) <= flashDuration {
+		flashing = true
+	}
+	if !valid {
+		annotation := "—"
+		if flashing {
+			annotation = flashStyle.Render("DISTILL") + "  " + annotation
+		}
+		return barState{pct: 0, fill: barEmpty, annotation: annotation}
+	}
+	pct := float64(drag) / float64(distillThresholdTokens)
+	style := barFillGreen
+	if pct >= 1.0 {
+		style = barFillRed
+	} else if pct >= 0.8 {
+		style = barFillAmber
+	}
+	annotation := fmt.Sprintf("%d%%   %s / %s tok", clampPct(pct), humanInt(drag), humanInt(distillThresholdTokens))
+	if flashing {
+		annotation = flashStyle.Render("DISTILL") + "  " + annotation
+	}
+	return barState{pct: pct, fill: style, annotation: annotation}
+}
+
+// renderBar draws "<label>  ████░░░░ <annotation>" sized to fit width.
+// The annotation is right-padded to annotationSlot cells so multiple bars
+// stacked together share the same bar width regardless of their per-row
+// annotation length. shoulderAt, when in [0,1], draws a small tick at
+// that fraction inside the empty portion to mark a threshold (e.g. the
+// 80% active/exploration split on the budget bar). Negative suppresses
+// the tick.
+func (m tuiModel) renderBar(width int, label string, pct float64, fill lipgloss.Style, annotation string, annotationSlot int, shoulderAt float64) string {
+	labelCell := infoStyle.Render(fmt.Sprintf("%-7s ", label))
+	labelWidth := lipgloss.Width(labelCell)
+
+	annoVisible := lipgloss.Width(annotation)
+	if annotationSlot < annoVisible {
+		annotationSlot = annoVisible
+	}
+	pad := annotationSlot - annoVisible
+	paddedAnnotation := " " + strings.Repeat(" ", pad) + annotation
+	annoWidth := 1 + annotationSlot
+
+	barWidth := width - labelWidth - annoWidth
+	if barWidth < 8 {
+		barWidth = 8
+	}
+
+	if pct < 0 {
+		pct = 0
+	}
+	displayPct := pct
+	if displayPct > 1 {
+		displayPct = 1
+	}
+	filled := int(float64(barWidth) * displayPct)
+	if filled > barWidth {
+		filled = barWidth
+	}
+	if pct > 0 && filled == 0 {
+		filled = 1
+	}
+
+	emptyCells := barWidth - filled
+	emptyRunes := make([]rune, emptyCells)
+	for i := range emptyRunes {
+		emptyRunes[i] = '░'
+	}
+	if shoulderAt >= 0 && shoulderAt < 1 {
+		shoulderIdx := int(float64(barWidth) * shoulderAt)
+		if shoulderIdx >= filled && shoulderIdx-filled < emptyCells {
+			emptyRunes[shoulderIdx-filled] = '┊'
+		}
+	}
+	bar := fill.Render(strings.Repeat("█", filled)) + barEmpty.Render(string(emptyRunes))
+	return labelCell + bar + infoStyle.Render(paddedAnnotation)
+}
+
+// libraryStateData carries enough to render the library bar after the
+// shared annotation slot has been computed. The state's annotation
+// participates in slot sizing; placeholder is the message that replaces
+// the bar when there are no programs / no tokens to render.
+type libraryStateData struct {
+	snap        []ProgramSnapshot
+	annotation  string
+	placeholder string
+	totalTokens int
+}
+
+func (m tuiModel) libraryState() libraryStateData {
+	snap := m.agent.LastProgramSnapshot()
+	if len(snap) == 0 {
+		return libraryStateData{snap: nil, annotation: "—", placeholder: "(no programs yet)"}
+	}
+	total := 0
+	for _, s := range snap {
+		total += s.RenderedTokens
+	}
+	annotation := fmt.Sprintf("%d / %d changed", countChanged(snap), len(snap))
+	placeholder := ""
+	if total <= 0 {
+		placeholder = "(0 tokens)"
+	}
+	return libraryStateData{snap: snap, annotation: annotation, placeholder: placeholder, totalTokens: total}
+}
+
+func (m tuiModel) renderLibraryBar(width int, lib libraryStateData, annotationSlot int) string {
+	labelCell := infoStyle.Render(fmt.Sprintf("%-7s ", "library"))
+	labelWidth := lipgloss.Width(labelCell)
+
+	annoVisible := lipgloss.Width(lib.annotation)
+	if annotationSlot < annoVisible {
+		annotationSlot = annoVisible
+	}
+	pad := annotationSlot - annoVisible
+	paddedAnnotation := " " + strings.Repeat(" ", pad) + lib.annotation
+	annoWidth := 1 + annotationSlot
+
+	barWidth := width - labelWidth - annoWidth
+	if barWidth < 8 {
+		barWidth = 8
+	}
+
+	if lib.placeholder != "" || len(lib.snap) == 0 {
+		body := lib.placeholder
+		if body == "" {
+			body = "—"
+		}
+		return labelCell + mutedStyle.Render(body) + infoStyle.Render(paddedAnnotation)
+	}
+
+	iter := m.agent.Iteration()
+	cells := allocateCells(lib.snap, barWidth)
+	var b strings.Builder
+	activeIdx := 0
+	for i, s := range lib.snap {
+		w := cells[i]
+		if w <= 0 {
+			continue
+		}
+		pulsing := false
+		if s.ChangedThisIter && m.pulsedAtIter[s.Name] != iter {
+			m.pulsedAtIter[s.Name] = iter
+			pulsing = true
+		}
+		palette := librarySegmentPalette[activeIdx%len(librarySegmentPalette)]
+		b.WriteString(segmentRender(s, w, pulsing, palette))
+		if s.Active && !s.Dropped {
+			activeIdx++
+		}
+	}
+	return labelCell + b.String() + infoStyle.Render(paddedAnnotation)
+}
+
+func segmentRender(s ProgramSnapshot, width int, pulsing bool, activePalette lipgloss.Style) string {
+	var style lipgloss.Style
+	ch := "█"
 	switch {
-	case entry.isAssistantText():
-		label = roleAsstStyle.Render("ASSISTANT")
-	case entry.isUserText():
-		label = blockHeaderStyle.Render(firstLine(entry.userText.Text))
+	case s.Dropped:
+		style = barFillRed
+		ch = "▒"
+	case !s.Active && s.IncludedInContext:
+		style = mutedStyle
+		ch = "▒"
+	case !s.Active:
+		style = mutedStyle
+		ch = "░"
+	case pulsing:
+		style = flashStyle
+		ch = "█"
+	default:
+		style = activePalette
+		ch = "█"
 	}
-
-	out := label
-
-	vp := m.msgViewports[i]
-	if vp.TotalLineCount() > vp.Height {
-		visibleEnd := vp.YOffset + vp.Height
-		if visibleEnd > vp.TotalLineCount() {
-			visibleEnd = vp.TotalLineCount()
-		}
-		sep := ""
-		if label != "" {
-			sep = "  "
-		}
-		out += sep + scrollInfoStyle.Render(fmt.Sprintf("[%d–%d/%d]", vp.YOffset+1, visibleEnd, vp.TotalLineCount()))
-	}
-	return out
+	return style.Render(strings.Repeat(ch, width))
 }
 
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[:i]
+func allocateCells(snap []ProgramSnapshot, width int) []int {
+	cells := make([]int, len(snap))
+	total := 0
+	for _, s := range snap {
+		total += s.RenderedTokens
 	}
-	return s
-}
-
-func skipFirstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[i+1:]
+	if total <= 0 {
+		return cells
 	}
-	return ""
-}
-
-func (m tuiModel) renderFooter() string {
-	parts := []string{}
-	switch m.state {
-	case stateReady:
-		parts = append(parts, footerKeyStyle.Render("enter")+footerStyle.Render(" step"))
-	case stateRunning:
-		parts = append(parts, footerStyle.Render("waiting for model…"))
-	case stateDone, stateError:
-		parts = append(parts, footerKeyStyle.Render("enter")+footerStyle.Render(" exit"))
+	remaining := width
+	for i, s := range snap {
+		w := int(float64(s.RenderedTokens) / float64(total) * float64(width))
+		cells[i] = w
+		remaining -= w
 	}
-	mode := "auto"
-	if m.stepThrough {
-		mode = "manual"
-	}
-	parts = append(parts,
-		footerKeyStyle.Render("s")+footerStyle.Render(" "+mode),
-		footerKeyStyle.Render("tab/shift+tab")+footerStyle.Render(" focus next/prev"),
-		footerKeyStyle.Render("↑/↓")+footerStyle.Render(" scroll"),
-		footerKeyStyle.Render("q")+footerStyle.Render(" quit"),
-	)
-	return footerStyle.Render(strings.Repeat("─", m.contentWidth())) + "\n" + strings.Join(parts, footerStyle.Render("  •  "))
-}
-
-func renderBlock(entry blockEntry, width int) string {
-	switch {
-	case entry.userText != nil:
-		// User text blocks promote their first line (front matter like
-		// `[program=… exit=…]` or `[YOUR GOAL]`) into the block header.
-		return wrapStyled(userTextStyle, skipFirstLine(entry.userText.Text), width)
-	case entry.asstText != nil:
-		return wrapStyled(asstTextStyle, entry.asstText.Text, width)
-	case entry.thinking != nil:
-		body := entry.thinking.Thinking
-		if entry.thinking.Redacted {
-			body = "(redacted)"
-		}
-		return wrapStyled(thinkingStyle, "(thinking) "+body, width)
-	case entry.toolCall != nil:
-		input := string(entry.toolCall.Arguments)
-		if input == "" {
-			input = "{}"
-		} else {
-			// Pretty up by re-marshalling if it parses; fall back to raw.
-			var v any
-			if err := json.Unmarshal(entry.toolCall.Arguments, &v); err == nil {
-				if b, err := json.Marshal(v); err == nil {
-					input = string(b)
-				}
+	// Distribute leftover cells to the largest programs first so rounding
+	// doesn't always pile onto the leftmost segment.
+	for remaining > 0 {
+		best, bestVal := -1, -1
+		for i, s := range snap {
+			if s.RenderedTokens > bestVal {
+				best = i
+				bestVal = s.RenderedTokens
 			}
 		}
-		combined := toolNameStyle.Render("→ "+entry.toolCall.Name) + toolUseStyle.Render("("+input+")")
-		return lipgloss.NewStyle().Width(width).Render(combined)
-	case entry.toolResult != nil:
-		text := provider.JoinText(entry.toolResult.Content)
-		label := "← result:"
-		style := toolOkStyle
-		if entry.toolResult.IsError {
-			label = "← error:"
-			style = toolErrStyle
+		if best < 0 {
+			break
 		}
-		return wrapStyled(style, label+"\n"+indent(text, "  "), width)
+		cells[best]++
+		remaining--
 	}
-	return headerInfoStyle.Render("(unsupported block)")
+	return cells
 }
 
-func wrapStyled(style lipgloss.Style, text string, width int) string {
-	if width < 1 {
-		width = 1
+func countChanged(snap []ProgramSnapshot) int {
+	n := 0
+	for _, s := range snap {
+		if s.ChangedThisIter {
+			n++
+		}
 	}
-	return style.Width(width).Render(text)
+	return n
 }
 
-func indent(s, prefix string) string {
-	if s == "" {
-		return ""
+func (m tuiModel) renderAssistant(width int) string {
+	text := latestAssistantText(m.agent.Conversation())
+	if text == "" {
+		return mutedStyle.Width(width).Height(assistantPanelLines).Render("(waiting for first response)")
 	}
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		lines[i] = prefix + line
+	wrapped := asstStyle.Width(width).Render(text)
+	lines := strings.Split(wrapped, "\n")
+	if len(lines) > assistantPanelLines {
+		lines = lines[:assistantPanelLines]
+		// Mark truncation on the last visible line.
+		last := lines[assistantPanelLines-1]
+		if lipgloss.Width(last) > 1 {
+			lines[assistantPanelLines-1] = last + mutedStyle.Render(" …")
+		} else {
+			lines[assistantPanelLines-1] = mutedStyle.Render("…")
+		}
+	}
+	for len(lines) < assistantPanelLines {
+		lines = append(lines, "")
 	}
 	return strings.Join(lines, "\n")
 }
+
+func latestAssistantText(conversation []provider.Message) string {
+	for i := len(conversation) - 1; i >= 0; i-- {
+		am, ok := conversation[i].(provider.AssistantMessage)
+		if !ok {
+			continue
+		}
+		for j := len(am.Content) - 1; j >= 0; j-- {
+			if tc, ok := am.Content[j].(provider.TextContent); ok && strings.TrimSpace(tc.Text) != "" {
+				return tc.Text
+			}
+		}
+	}
+	return ""
+}
+
+func (m tuiModel) renderFooter(width int) string {
+	state := ""
+	switch m.state {
+	case stateInit:
+		state = "priming…"
+	case stateRunning:
+		state = "running"
+	case stateDone:
+		state = "done — press enter to exit"
+	case stateError:
+		state = "error — press enter to exit"
+	}
+	left := footerKey.Render("q") + footerLabel.Render(" quit")
+	right := footerLabel.Render(state)
+	pad := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if pad < 1 {
+		pad = 1
+	}
+	return left + strings.Repeat(" ", pad) + right
+}
+
+func humanInt(n int) string {
+	if n < 0 {
+		n = 0
+	}
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	// Insert thousands separators.
+	s := fmt.Sprintf("%d", n)
+	var b strings.Builder
+	off := len(s) % 3
+	if off > 0 {
+		b.WriteString(s[:off])
+		if len(s) > off {
+			b.WriteString(",")
+		}
+	}
+	for i := off; i < len(s); i += 3 {
+		b.WriteString(s[i : i+3])
+		if i+3 < len(s) {
+			b.WriteString(",")
+		}
+	}
+	return b.String()
+}
+
+func clampPct(p float64) int {
+	if p < 0 {
+		return 0
+	}
+	if p > 9.99 {
+		return 999
+	}
+	return int(p*100 + 0.5)
+}
+

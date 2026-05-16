@@ -141,7 +141,7 @@ Then run the agent:
 ```
 autoprobe run                            # run autoprobe on the .autoprobe/ directory
 autoprobe run --goal "make tests pass"   # inline goal, appended as a final program output
-autoprobe run --debug                    # pause between iterations
+autoprobe run -n 20                      # bounded run; exits after 20 iterations
 ```
 
 ## Evaluation

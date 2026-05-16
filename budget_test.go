@@ -39,7 +39,7 @@ func newAgentWithPrograms(t *testing.T, specs ...programSpec) *Agent {
 			t.Fatal(err)
 		}
 	}
-	return NewAgent(nil, root, "", false, 0)
+	return NewAgent(nil, root, "", 0)
 }
 
 // writeInactive writes a .autoprobe/inactive file with the given program
