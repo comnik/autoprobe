@@ -47,6 +47,12 @@
       <h2>conversation</h2>
       <div id="messages">
         {{range .Messages}}
+        {{if or (eq .Role "system") (eq .Role "tools")}}
+        <details class="message {{.Role}}"{{if .Anchor}} id="{{.Anchor}}"{{end}}>
+          <summary class="message-role">{{.RoleLabel}}{{if eq .Role "tools"}} ({{len .Blocks}}){{end}}</summary>
+          {{if eq .Role "tools"}}<div class="tools">{{range .Blocks}}{{template "block" .}}{{end}}</div>{{else}}{{range .Blocks}}{{template "block" .}}{{end}}{{end}}
+        </details>
+        {{else}}
         <div class="message {{.Role}}{{if .IsError}} error{{end}}"{{if .Anchor}} id="{{.Anchor}}"{{end}}>
           <div class="message-role">
             {{.RoleLabel}}
@@ -54,6 +60,7 @@
           </div>
           {{range .Blocks}}{{template "block" .}}{{end}}
         </div>
+        {{end}}
         {{end}}
       </div>
     </div>
@@ -164,5 +171,11 @@
 <div class="block note">{{.Text}}</div>
 {{- else if eq .Kind "tool_result_body" -}}
 <div class="tool-result-body">{{.Text}}</div>
+{{- else if eq .Kind "tool_def" -}}
+<div class="tool-def">
+  <div class="tool-def-header"><span class="tool-name">{{.ToolDef.Name}}</span></div>
+  {{if .ToolDef.Description}}<div class="tool-def-desc">{{.ToolDef.Description}}</div>{{end}}
+  <pre class="tool-def-params">{{.ToolDef.Parameters}}</pre>
+</div>
 {{- end -}}
 {{end}}

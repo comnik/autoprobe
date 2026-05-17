@@ -177,11 +177,24 @@ type IterationTrace struct {
 	StatsSnapshot   map[string]*programStats `json:"stats_snapshot"`
 }
 
-// TraceContext is the exact context window the harness sent to the
-// provider for this iteration: a flat sequence of user / assistant /
-// tool_result messages in the order they were submitted.
+// TraceContext is the exact provider.Context the harness handed to the
+// provider for this iteration. Captured straight off the struct that was
+// passed to provider.Generate, so the trace and the live request can never
+// drift: system prompt, tool schemas, and the flat sequence of user /
+// assistant / tool_result messages in the order they were submitted.
 type TraceContext struct {
-	Messages []traceMessage `json:"messages"`
+	SystemPrompt string         `json:"system_prompt,omitempty"`
+	Messages     []traceMessage `json:"messages"`
+	Tools        []traceTool    `json:"tools,omitempty"`
+}
+
+// traceTool mirrors provider.ToolDefinition. Parameters is captured as a
+// generic map so the JSON faithfully reproduces whatever schema each tool
+// declared, without the trace layer needing to know individual shapes.
+type traceTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 // traceMessage is the union JSON shape across user, assistant, and
@@ -369,6 +382,33 @@ func stopReasonString(s provider.StopReason) string {
 	default:
 		return "unknown"
 	}
+}
+
+// serializeProviderContext turns the exact provider.Context that was
+// passed to provider.Generate into the trace's TraceContext. Same struct,
+// one source of truth: whatever bytes the model saw are what land in the
+// trace.
+func serializeProviderContext(c provider.Context) TraceContext {
+	return TraceContext{
+		SystemPrompt: c.SystemPrompt,
+		Messages:     serializeContextMessages(c.Messages),
+		Tools:        serializeTools(c.Tools),
+	}
+}
+
+func serializeTools(tools []provider.ToolDefinition) []traceTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]traceTool, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, traceTool{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		})
+	}
+	return out
 }
 
 // serializeContextMessages turns the live conversation slice into the

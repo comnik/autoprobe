@@ -634,15 +634,15 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 	// Snapshot the slice header that gets sent to the provider so a later
 	// append (assistant message, tool results) doesn't bleed into the
 	// trace's captured context — len is fixed here even if the underlying
-	// array grows.
-	contextMsgs := a.conversation
-	c := provider.Context{
+	// array grows. The same Context value is later handed to the tracer so
+	// the trace's input record is byte-for-byte what the model saw.
+	sent := provider.Context{
 		SystemPrompt: a.workSystemPrompt,
-		Messages:     contextMsgs,
+		Messages:     a.conversation,
 		Tools:        a.toolSchemas(),
 	}
 	a.setPhase(PhaseInference)
-	msg, err := a.provider.Generate(ctx, "", c, provider.Options{MaxTokens: 8192})
+	msg, err := a.provider.Generate(ctx, "", sent, provider.Options{MaxTokens: 8192})
 	if err != nil {
 		return provider.AssistantMessage{}, false, err
 	}
@@ -742,7 +742,7 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 		a.conversation = append(a.conversation, tr)
 	}
 
-	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, contextMsgs, msg, toolResults, data, userMsg, showPrompt, yieldFired, TurnWork)
+	a.writeTrace(iterStartedAt, time.Now(), idlePollsBefore, idleWait, sent, msg, toolResults, data, userMsg, showPrompt, yieldFired, TurnWork)
 
 	// Work-cycle close: evaluate cadence and possibly flip to modeling.
 	// Termination semantics: the agent terminates after the wrap-up
@@ -813,14 +813,15 @@ func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bo
 	a.refreshSnapshot(data, userMsg)
 
 	iterStartedAt := time.Now()
-	contextMsgs := a.conversation
-	c := provider.Context{
+	// Same Context value goes to provider.Generate and to the tracer below,
+	// so the trace's input record matches what the model actually saw.
+	sent := provider.Context{
 		SystemPrompt: a.modelingSystemPrompt,
-		Messages:     contextMsgs,
+		Messages:     a.conversation,
 		Tools:        a.toolSchemas(),
 	}
 	a.setPhase(PhaseInference)
-	msg, err := a.provider.Generate(ctx, "", c, provider.Options{MaxTokens: 8192})
+	msg, err := a.provider.Generate(ctx, "", sent, provider.Options{MaxTokens: 8192})
 	if err != nil {
 		return provider.AssistantMessage{}, false, err
 	}
@@ -860,7 +861,7 @@ func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bo
 		a.conversation = append(a.conversation, tr)
 	}
 
-	a.writeTrace(iterStartedAt, time.Now(), 0, 0, contextMsgs, msg, toolResults, data, userMsg, false, false, TurnModeling)
+	a.writeTrace(iterStartedAt, time.Now(), 0, 0, sent, msg, toolResults, data, userMsg, false, false, TurnModeling)
 
 	// Modeling-turn close: when the model stops calling tools or the
 	// in-turn step cap is exceeded, evaluate no-op suppression, clear
@@ -950,7 +951,7 @@ func (a *Agent) writeTrace(
 	started, completed time.Time,
 	idlePolls int,
 	idleWait time.Duration,
-	contextMsgs []provider.Message,
+	sent provider.Context,
 	resp provider.AssistantMessage,
 	toolResults []provider.ToolResultMessage,
 	data iterationData,
@@ -972,7 +973,7 @@ func (a *Agent) writeTrace(
 		CompletedAt:     completed,
 		IdlePollsBefore: idlePolls,
 		IdleWaitMs:      idleWait.Milliseconds(),
-		Context:         TraceContext{Messages: serializeContextMessages(contextMsgs)},
+		Context:         serializeProviderContext(sent),
 		Response: TraceResponse{
 			Model:      resp.Model,
 			StopReason: stopReasonString(resp.StopReason),

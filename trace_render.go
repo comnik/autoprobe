@@ -73,6 +73,12 @@ type iterView struct {
 	HasStats        bool
 }
 
+type viewTool struct {
+	Name        string
+	Description string
+	Parameters  string // pretty-printed JSON
+}
+
 type viewMessage struct {
 	Role       string
 	RoleLabel  string
@@ -94,6 +100,7 @@ type viewBlock struct {
 	ProgramName        string
 	ProgramTail        string
 	ProgramExitNonzero bool
+	ToolDef            *viewTool
 }
 
 type viewStat struct {
@@ -202,7 +209,7 @@ func buildIterView(header RunHeader, rec IterationTrace, prevN, nextN, total int
 		TotalIterations: total,
 		PrevN:           prevN,
 		NextN:           nextN,
-		Messages:        buildViewMessages(rec.Context.Messages, rec.Response, rec.ToolResults),
+		Messages:        buildViewMessages(rec.Context, rec.Response, rec.ToolResults),
 	}
 	if prevN > 0 {
 		v.PrevHref = iterationHTMLName(prevN)
@@ -237,11 +244,34 @@ func buildIterView(header RunHeader, rec IterationTrace, prevN, nextN, total int
 	return v
 }
 
-// buildViewMessages concatenates the input context, the assistant
-// response, and the synthesized tool results into one chat-style slice.
-func buildViewMessages(input []traceMessage, resp TraceResponse, toolResults []TraceToolResult) []viewMessage {
-	out := make([]viewMessage, 0, len(input)+1+len(toolResults))
-	for _, m := range input {
+// buildViewMessages concatenates the input context — system prompt, tool
+// schemas, and the flat message list — followed by the assistant response
+// and the synthesized tool results, into one chat-style slice. The system
+// prompt and tools are rendered as leading pseudo-messages so the trace
+// shows exactly what the model saw, in the same order the provider packs
+// it (system → tools → messages), with no separate codepath.
+func buildViewMessages(ctx TraceContext, resp TraceResponse, toolResults []TraceToolResult) []viewMessage {
+	out := make([]viewMessage, 0, 2+len(ctx.Messages)+1+len(toolResults))
+	if ctx.SystemPrompt != "" {
+		out = append(out, viewMessage{
+			Role:      "system",
+			RoleLabel: "system",
+			Blocks:    []viewBlock{{Kind: "text", Text: ctx.SystemPrompt}},
+		})
+	}
+	if len(ctx.Tools) > 0 {
+		blocks := make([]viewBlock, 0, len(ctx.Tools))
+		for _, t := range ctx.Tools {
+			td := viewTool{Name: t.Name, Description: t.Description, Parameters: prettyArgs(t.Parameters)}
+			blocks = append(blocks, viewBlock{Kind: "tool_def", ToolDef: &td})
+		}
+		out = append(out, viewMessage{
+			Role:      "tools",
+			RoleLabel: "tools",
+			Blocks:    blocks,
+		})
+	}
+	for _, m := range ctx.Messages {
 		out = append(out, convertMessage(m))
 	}
 	out = append(out, viewMessage{

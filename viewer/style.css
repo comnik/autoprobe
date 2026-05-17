@@ -210,6 +210,22 @@ table.iter-list .empty { padding: 24px; text-align: center; color: var(--muted);
 .message.assistant   { background: var(--assistantMessageBg); padding: 0; }
 .message.tool_result { background: var(--toolSuccessBg); }
 .message.tool_result.error { background: var(--toolErrorBg); }
+.message.system,
+.message.tools { background: var(--info-bg); cursor: pointer; }
+.message.system > summary.message-role,
+.message.tools  > summary.message-role { color: var(--warning); list-style: none; }
+.message.system > summary.message-role::-webkit-details-marker,
+.message.tools  > summary.message-role::-webkit-details-marker { display: none; }
+.message.system > summary.message-role::before,
+.message.tools  > summary.message-role::before { content: "▸ "; }
+.message.system[open] > summary.message-role::before,
+.message.tools[open]  > summary.message-role::before { content: "▾ "; }
+.message.system[open] > :not(summary) { margin-top: 6px; white-space: pre-wrap; }
+.message.tools[open]  > .tools { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.tool-def { border-left: 2px solid var(--borderMuted); padding-left: 8px; }
+.tool-def-header .tool-name { font-weight: bold; }
+.tool-def-desc { color: var(--muted); margin-top: 2px; }
+.tool-def-params { margin-top: 4px; white-space: pre-wrap; color: var(--dim); }
 
 .message-role {
   font-size: 10px;
