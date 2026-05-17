@@ -73,10 +73,14 @@ const (
 	// threshold until the model actually ends the cycle.
 	modelingCooldownSteps = 5
 
-	// Maximum number of inference sub-steps inside one modeling turn before
-	// the harness force-closes it. Mirrors the work cycle's existing
-	// protections so a runaway modeling turn cannot block forward progress.
-	modelingTurnStepCap = 8
+	// Step count inside a modeling turn that, once reached on a step that
+	// ended StopToolUse, triggers a one-shot YIELD nudge appended to the
+	// last tool result. Mirrors the work cycle's YIELD mechanism: an
+	// advisory ask to wrap the turn, not a hard truncation. Healthy
+	// modeling turns close in 1–3 steps; firing at 5 catches turns that
+	// are spinning without cutting off ones doing real work. A model that
+	// ignores the nudge is bounded by the global maxIterations budget.
+	modelingYieldStepThreshold = 5
 
 	// Periodic safety net: force a modeling turn after this many consecutive
 	// work cycles with no other trigger, so long quiet phases still get
@@ -133,6 +137,20 @@ Some commonly useful programs:
 When you have installed enough to give the first work cycle traction,
 respond with a brief plain-text summary and NO further tool calls.`
 
+// modelingYieldGuidance is the YIELD nudge appended to the last tool
+// result when a modeling turn has run for modelingYieldStepThreshold
+// steps without closing. Mirrors the work-mode yield prompt: an advisory
+// ask to wrap, not a hard truncation. Suppressed on bootstrap turns,
+// which legitimately do more exploration. Inline for now; promote to a
+// reinforcement asset if it grows.
+const modelingYieldGuidance = `[YIELD]
+You have spent several steps in this modeling turn. The library on disk
+is the durable output here — anything that doesn't land as a program or
+an inactive entry costs inference without persisting.
+
+Wrap up: respond with a brief plain-text summary and NO further tool calls.
+The next work cycle will start with your updated library in context.`
+
 const modelingFinalGuidance = `[MODELING GUIDANCE — FINAL]
 The iteration budget configured with -n has been reached. This is the
 wrap-up modeling turn before the harness terminates the run. Anything not
@@ -188,7 +206,7 @@ type Agent struct {
 	tracer           *Tracer
 
 	conversation    []provider.Message
-	iteration       int
+	workIteration   int // counts substantive work inferences; advances at the end of stepWork only. Surfaced to the TUI ("iter N") and stamped on trace records for timeline grouping. Distinct from totalIterations, which is the cost-accounting counter checked against maxIterations.
 	totalIterations int // counts every runIteration call, including idle polls
 
 	// Carried across Steps. lastStopReason controls whether the prior
@@ -272,7 +290,9 @@ type Agent struct {
 	// Modeling-turn state.
 	//
 	// modelingStepsThisTurn counts inference sub-steps inside one modeling
-	// turn so the harness can enforce modelingTurnStepCap.
+	// turn. Used to (a) distinguish the first step from subsequent steps
+	// (kickoff user message vs. fresh program-output region) and (b) gate
+	// the modeling-side YIELD nudge.
 	//
 	// workCycleTranscript is the prior work cycle's conversation tail
 	// (everything after the leading user message), captured at the moment
@@ -294,15 +314,22 @@ type Agent struct {
 	// just-closed work cycle — the cadence predicate reads it once at
 	// cycle close to decide whether the default trigger fires.
 	//
+	// modelingYieldFiredThisTurn ensures the modeling-side YIELD nudge
+	// fires at most once per modeling turn; cleared when the turn closes.
+	//
 	// needsBootstrap marks the very first modeling turn so the user-message
 	// guidance switches to bootstrap framing (no prior cycle to review).
-	modelingStepsThisTurn   int
-	workCycleTranscript     []provider.Message
-	preModelingLibraryHash  [sha256.Size]byte
-	modelingNoOpSuppressed  bool
-	workCyclesSinceModeling int
-	yieldFiredThisCycle     bool
-	needsBootstrap          bool
+	// Also suppresses the modeling-side YIELD nudge: bootstrap turns
+	// legitimately do more exploration to install the initial library and
+	// shouldn't be nudged to wrap up early.
+	modelingStepsThisTurn      int
+	workCycleTranscript        []provider.Message
+	preModelingLibraryHash     [sha256.Size]byte
+	modelingNoOpSuppressed     bool
+	workCyclesSinceModeling    int
+	yieldFiredThisCycle        bool
+	modelingYieldFiredThisTurn bool
+	needsBootstrap             bool
 
 	// traceSeq is the monotonic record counter for trace writes. Advances
 	// on every Step (work or modeling) so each iter-NNNNN.html filename is
@@ -334,7 +361,7 @@ func (a *Agent) IdleStatus() (polls int, since time.Duration, active bool) {
 }
 
 func (a *Agent) Conversation() []provider.Message { return a.conversation }
-func (a *Agent) Iteration() int                   { return a.iteration }
+func (a *Agent) WorkIteration() int               { return a.workIteration }
 func (a *Agent) Provider() provider.Provider      { return a.provider }
 func (a *Agent) ContextBudget() int               { return a.contextBudget }
 
@@ -591,7 +618,7 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 		a.totalIterations++
 
 		midCycle := a.lastStopReason == provider.StopToolUse
-		if !midCycle && a.iteration > 0 && fresh.hash == a.lastOutputHash {
+		if !midCycle && a.workIteration > 0 && fresh.hash == a.lastOutputHash {
 			if a.reachedMaxIterations() {
 				// Hitting the cap while idle: the (skipped) idle turn stands
 				// in for the final normal turn — shortcut into the wrap-up
@@ -671,7 +698,7 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 	}
 	a.updateStats(data.results, joinAssistantText(msg.Content))
 
-	a.iteration++
+	a.workIteration++
 	// On the StopToolUse → StopEnd transition the agent has yielded after
 	// doing real work, and its narrative typically expects "the next cycle
 	// to start clean." Clear the cached hash so the next Step's idle check
@@ -765,7 +792,7 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 }
 
 // stepModeling runs a single inference inside the current modeling turn.
-// Modeling steps do not advance a.iteration, do not engage idle backoff,
+// Modeling steps do not advance a.workIteration, do not engage idle backoff,
 // and use the modeling system prompt. The first step of a modeling turn
 // builds the kickoff user message (program outputs + prior cycle transcript
 // + guidance); subsequent steps preserve assistant/tool history exactly
@@ -857,22 +884,47 @@ func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bo
 			toolResults = append(toolResults, a.executeTool(call))
 		}
 	}
+
+	// Modeling-side YIELD nudge. Once the turn has run for
+	// modelingYieldStepThreshold steps and is still mid tool-use,
+	// append a one-shot wrap-up prompt to the last tool result so the
+	// model sees it right before its next response. Suppressed on the
+	// bootstrap turn (initial library construction legitimately takes
+	// more exploration) and on the wrap-up turn (final guidance already
+	// frames it as the last chance to persist). The global maxIterations
+	// budget remains the ultimate runaway guard for a model that ignores
+	// the nudge.
+	if msg.StopReason == provider.StopToolUse &&
+		!a.modelingYieldFiredThisTurn &&
+		!a.needsBootstrap &&
+		!a.finalPhase &&
+		a.modelingStepsThisTurn >= modelingYieldStepThreshold &&
+		len(toolResults) > 0 {
+		last := &toolResults[len(toolResults)-1]
+		last.Content = append(last.Content, provider.TextContent{Text: modelingYieldGuidance})
+		a.modelingYieldFiredThisTurn = true
+	}
+
 	for _, tr := range toolResults {
 		a.conversation = append(a.conversation, tr)
 	}
 
 	a.writeTrace(iterStartedAt, time.Now(), 0, 0, sent, msg, toolResults, data, userMsg, false, false, TurnModeling)
 
-	// Modeling-turn close: when the model stops calling tools or the
-	// in-turn step cap is exceeded, evaluate no-op suppression, clear
-	// modeling state, and flip back to work mode. If finalPhase is set
-	// (this was the wrap-up modeling turn), terminate.
-	turnClosed := msg.StopReason != provider.StopToolUse || a.modelingStepsThisTurn >= modelingTurnStepCap
+	// Modeling-turn close: when the model stops calling tools, evaluate
+	// no-op suppression, clear modeling state, and flip back to work
+	// mode. If finalPhase is set (this was the wrap-up modeling turn),
+	// terminate. There is no per-turn step cap: runaway protection
+	// inside a turn is the YIELD nudge above, and run-scope protection
+	// is the global maxIterations budget enforced at work-cycle
+	// boundaries.
+	turnClosed := msg.StopReason != provider.StopToolUse
 	if turnClosed {
 		postHash := a.libraryHash()
 		a.modelingNoOpSuppressed = postHash == a.preModelingLibraryHash
 		a.currentTurnKind.Store(uint32(TurnWork))
 		a.modelingStepsThisTurn = 0
+		a.modelingYieldFiredThisTurn = false
 		a.workCycleTranscript = nil
 		a.needsBootstrap = false
 		a.workCyclesSinceModeling = 0
@@ -967,7 +1019,7 @@ func (a *Agent) writeTrace(
 	activeBudget := a.contextBudget * activeBudgetPercent / 100
 	rec := IterationTrace{
 		Iteration:       a.traceSeq,
-		WorkIteration:   a.iteration,
+		WorkIteration:   a.workIteration,
 		TurnKind:        kind.String(),
 		StartedAt:       started,
 		CompletedAt:     completed,

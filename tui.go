@@ -511,7 +511,7 @@ func (m tuiModel) renderLibraryBar(width int, lib libraryStateData, annotationSl
 		return labelCell + mutedStyle.Render(body) + infoStyle.Render(paddedAnnotation)
 	}
 
-	iter := m.agent.Iteration()
+	iter := m.agent.WorkIteration()
 	cells := allocateCells(lib.snap, barWidth)
 	var b strings.Builder
 	activeIdx := 0

@@ -274,24 +274,44 @@ distinct `kind` flag threaded through, controlling:
 
 - which system prompt is used (work-mode cornerstone vs. modeling-mode
   asset);
-- whether the iteration counter (`a.iteration`) advances — it does for
-  work iterations, it does not for modeling turns. `maxIterations` (`-n`)
-  is a budget over work iterations only;
+- whether the work-iteration counter (`a.iteration`) advances — it does
+  for work iterations, it does not for modeling turns. The work counter
+  is a user-facing notion of "how far through the goal we are," which
+  modeling turns don't add to;
 - which cache breakpoint set is applied (see [Prompt
   caching](#prompt-caching) below);
 - which value is written into the trace's `turn_kind` field.
 
-The modeling turn has its own in-turn safety cap — a maximum number of
-inference steps inside one modeling turn (default: 8). Beyond that, the
-harness closes the modeling turn even if the model is still calling
-tools, logs the truncation, and proceeds to the next work cycle. This
-mirrors the work cycle's existing protections and prevents a runaway
-modeling turn from blocking forward progress.
+`maxIterations` (`-n`) is the run's global anti-runaway budget: it
+counts every inference the harness issues, regardless of turn kind,
+against a single ceiling. Modeling inferences consume the same budget
+as work inferences. The rationale is that `-n` is a proxy for "how
+much can this run spend before I want it to stop" — eventually denominated
+in dollars or wall-clock time rather than inference count — and a
+modeling turn that spins is just as much a runaway as a work cycle that
+spins. The counter that the budget compares against is therefore
+`a.totalIterations`, not the work-only `a.iteration`. The switch to a
+$/time denomination is deferred; the structural fix (counting both turn
+kinds against one budget) is what matters here.
+
+Within a single modeling turn the harness does not enforce a hard
+step-count cap. Runaway protection inside a turn is the modeling-mode
+YIELD nudge (mirroring the work-cycle yield, see [The in-cycle
+reinforcement becomes yield-only](#the-in-cycle-reinforcement-becomes-yield-only)
+above): when in-turn drag crosses the threshold, a yield prompt is
+appended to the last tool result asking the modeling turn to wrap up
+with a brief plain-text summary and no further tool calls. A model that
+ignores the nudge is bounded by the global `maxIterations` budget,
+which terminates the run if any combination of turns spins past the
+ceiling. Per-turn forcible truncation (the old hard cap) is therefore
+unnecessary — global budget + advisory nudge cover the failure modes
+the hard cap was meant to address, without the risk of cutting a
+modeling turn off mid-tool-use.
 
 #### Failure handling
 
-If a modeling turn hits a provider error, exceeds its in-turn cap, or
-otherwise terminates abnormally:
+If a modeling turn hits a provider error, hits the global
+`maxIterations` budget mid-turn, or otherwise terminates abnormally:
 
 - Whatever library mutations the modeling turn *did* commit to disk stay
   committed — `programs/` and `inactive` are persistent state and not
