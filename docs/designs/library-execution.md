@@ -89,10 +89,12 @@ the header: `[program=foo exit=0; output truncated at 64KB]` or
 truncation can also compose: `[program=foo timed out after 5m; output
 truncated at 64KB; process group killed]`.
 
-The body of the result row is still the captured stdout/stderr — for
-timeouts, whatever bytes arrived before the kill; for spawn failures,
-the error text from `exec.Command.Start` (so the agent can see *what*
-failed); for prepared/stat failures, the same.
+The body of the result row depends on the status. For `exited` it is
+the captured stdout/stderr exactly as today. For `timed out` it is
+whatever bytes arrived before the kill. For `failed to start` and
+`could not be prepared` the error text lives in the header (so the
+agent reads the cause without scanning the body), and the body is
+empty.
 
 #### 2. Per-program timeout (5 minutes)
 
