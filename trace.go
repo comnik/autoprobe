@@ -241,10 +241,15 @@ type TraceToolResult struct {
 // conversation. `Included` is whether this program's full rendered output
 // (not a sentinel, not a random-skip) reached the context.
 // `ExplorationPhase` is set only for inactive programs and tags which
-// channel they fed through ("nonzero" or "random"); empty for active.
+// channel they fed through ("abnormal" or "random"); empty for active.
+// `Status` is the textual run status ("exited", "timed_out", etc.);
+// `Exit` is only meaningful when Status == "exited". `Truncated` is set
+// when the program's output was capped.
 type TraceProgram struct {
 	Name             string `json:"name"`
+	Status           string `json:"status"`
 	Exit             int    `json:"exit"`
+	Truncated        bool   `json:"truncated,omitempty"`
 	LatencyMs        int64  `json:"latency_ms"`
 	Active           bool   `json:"active"`
 	Included         bool   `json:"included"`
@@ -496,15 +501,17 @@ func buildTracePrograms(results []programResult, inactive map[string]struct{}, u
 		_, demoted := inactive[r.name]
 		phase := ""
 		if demoted {
-			if r.exitCode != 0 {
-				phase = "nonzero"
+			if r.abnormal() {
+				phase = "abnormal"
 			} else {
 				phase = "random"
 			}
 		}
 		out = append(out, TraceProgram{
 			Name:             r.name,
+			Status:           programStatusString(r.status),
 			Exit:             r.exitCode,
+			Truncated:        r.truncated,
 			LatencyMs:        r.latency.Milliseconds(),
 			Active:           !demoted,
 			Included:         included[r.name],
@@ -514,6 +521,23 @@ func buildTracePrograms(results []programResult, inactive map[string]struct{}, u
 		})
 	}
 	return out
+}
+
+// programStatusString renders a programStatus as the snake-case identifier
+// used in the trace JSON. The viewer keys CSS classes off these strings.
+func programStatusString(s programStatus) string {
+	switch s {
+	case programExited:
+		return "exited"
+	case programTimedOut:
+		return "timed_out"
+	case programFailedToStart:
+		return "failed_to_start"
+	case programCouldNotPrepare:
+		return "could_not_be_prepared"
+	default:
+		return "unknown"
+	}
 }
 
 // includedPrograms scans the user message for each program's exact
