@@ -56,19 +56,81 @@ sprite exec -s "${SPRITE_NAME}" -- bash -lc '
   sudo install -m 0755 "$(go env GOPATH)/bin/autoprobe" /usr/local/bin/autoprobe
 '
 
+echo "==> Locking down runner egress to api.anthropic.com:443"
+# Per-UID egress rules via nft so only the `runner` agent process is constrained;
+# sprite/root keep full network for docker, git, uvx. We use nft directly
+# (not iptables) because the sprite runs iptables-nft and the `xt_owner`
+# translation for `--uid-owner` isn't loaded — `meta skuid` is the native nft
+# match and needs no kernel module. Resolved IPs are pinned into /etc/hosts so
+# runner can connect without DNS, which lets us drop port 53 outright and shut
+# down DNS-tunnel exfiltration too. IPs are refreshed each run because
+# api.anthropic.com is Cloudflare-fronted and rotates; if a rotation lands
+# mid-run the API call fails closed, which is the right default.
+sprite exec -s "${SPRITE_NAME}" -- bash -lc '
+  set -euo pipefail
+
+  if ! command -v nft >/dev/null 2>&1; then
+    echo "error: nft not available on sprite" >&2
+    exit 1
+  fi
+
+  V4_IPS=$(getent ahostsv4 api.anthropic.com 2>/dev/null | awk "{print \$1}" | sort -u || true)
+  V6_IPS=$(getent ahostsv6 api.anthropic.com 2>/dev/null | awk "{print \$1}" | sort -u || true)
+  if [[ -z "$V4_IPS" && -z "$V6_IPS" ]]; then
+    echo "error: failed to resolve api.anthropic.com" >&2
+    exit 1
+  fi
+  echo "    api.anthropic.com -> $(echo $V4_IPS $V6_IPS | tr "\n" " ")"
+
+  sudo sed -i "/[[:space:]]api\.anthropic\.com$/d" /etc/hosts
+  for ip in $V4_IPS $V6_IPS; do
+    echo "$ip api.anthropic.com" | sudo tee -a /etc/hosts >/dev/null
+  done
+
+  RUNNER_UID=$(id -u runner)
+  V4_SET=$(echo $V4_IPS | tr " " ",")
+  V6_SET=$(echo $V6_IPS | tr " " ",")
+
+  RULES="    oif \"lo\" accept"$'\''\n'\''
+  RULES+="    meta skuid ${RUNNER_UID} ct state established,related accept"$'\''\n'\''
+  [[ -n "$V4_SET" ]] && RULES+="    meta skuid ${RUNNER_UID} ip daddr { ${V4_SET} } tcp dport 443 accept"$'\''\n'\''
+  [[ -n "$V6_SET" ]] && RULES+="    meta skuid ${RUNNER_UID} ip6 daddr { ${V6_SET} } tcp dport 443 accept"$'\''\n'\''
+  RULES+="    meta skuid ${RUNNER_UID} reject"
+
+  sudo nft "delete table inet autoprobe_egress" 2>/dev/null || true
+  sudo nft -f - <<NFT
+table inet autoprobe_egress {
+  chain output {
+    type filter hook output priority 0; policy accept;
+${RULES}
+  }
+}
+NFT
+
+  echo "    verifying lockdown..."
+  if ! sudo -n -u runner timeout 5 bash -c "exec 3<>/dev/tcp/api.anthropic.com/443" 2>/dev/null; then
+    echo "error: runner cannot reach api.anthropic.com:443 — lockdown misconfigured" >&2
+    exit 1
+  fi
+  if sudo -n -u runner timeout 5 bash -c "exec 3<>/dev/tcp/1.1.1.1/443" 2>/dev/null; then
+    echo "error: runner can still reach 1.1.1.1:443 — egress NOT locked down" >&2
+    exit 1
+  fi
+  echo "    ok: runner egress restricted to api.anthropic.com:443"
+'
+
 read -r -d "" GOAL <<EOF || true
 There is a binary plus documentation and related materials in the ${WORKSPACE} directory.
 
 Treat this binary as a black box and model its behaviour accurately and exhaustively.
 
 Don't access the internet, don't try to look up the source code.
-EOF
 
-# NOTE leaving this out as an experiment
-# Your goal is to exactly reimplement the functionality of this binary in a language of your choice, without access to the original source code.
-# Create a compile.sh script in ${WORKSPACE} that, when run with cwd=${WORKSPACE}, produces a working binary at ${WORKSPACE}/executable
-# (overwriting the sealed one). The grader will wipe the workspace, extract your submission, chmod +x compile.sh, and run ./compile.sh — so anything
-# needed at compile time must live in the workspace.
+Your goal is to exactly reimplement the functionality of this binary in a language of your choice, without access to the original source code.
+Create a compile.sh script in ${WORKSPACE} that, when run with cwd=${WORKSPACE}, produces a working binary at ${WORKSPACE}/executable
+(overwriting the sealed one). The grader will wipe the workspace, extract your submission, chmod +x compile.sh, and run ./compile.sh — so anything
+needed at compile time must live in the workspace.
+EOF
 
 echo "==> Running autoprobe as runner (${MODEL}, n=${ITERATIONS})"
 # sprite user (has sudo) hands off to runner (no sudo, not in docker group).
