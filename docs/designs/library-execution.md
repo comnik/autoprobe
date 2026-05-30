@@ -2,9 +2,9 @@
 
 ## Implementation status
 
-**Not started.** This doc captures the design as it is being scoped.
-Guardrails are described first; the async execution model is deferred to
-a follow-up section once the guardrails are settled.
+**Guardrails implemented.** The guardrails section below is implemented
+in `runPrograms` (`agent.go`) and covered by `programs_test.go`. The
+async execution model remains deferred to a follow-up.
 
 ## Problem
 
