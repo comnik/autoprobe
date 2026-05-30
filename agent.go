@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/comnik/autoprobe/internal/provider"
@@ -25,6 +26,26 @@ const (
 	idleBackoffInitial    = 1 * time.Second
 	idleBackoffMax        = 30 * time.Second
 	maxProgramConcurrency = 8
+
+	// Per-program execution timeout. On expiry runPrograms kills the
+	// program's process group (not just the direct child) and the result
+	// row renders with the "timed out" status. Library programs are meant
+	// to be cheap and re-runnable; a program that legitimately needs more
+	// than five minutes should be split, cached, or run via the bash tool
+	// on demand.
+	programTimeout = 5 * time.Minute
+
+	// Per-program output cap. Bytes past this limit are dropped on the
+	// floor (no temp-file spill — library programs re-run every iteration,
+	// so the next run is the natural place to fix verbose output) and the
+	// result row's header advertises the truncation.
+	maxProgramOutputBytes = 64 * 1024
+
+	// Grace period for a program's stdout/stderr to drain after the
+	// process exits. A detached grandchild that inherits the pipes would
+	// otherwise hold them open until it dies; the exit status from
+	// ProcessState is authoritative once Wait returns.
+	programWaitDelay = 100 * time.Millisecond
 
 	// Token ceiling for the assembled program-output portion of the context. 64K assumes a
 	// 128K maximum effective context window, leaving roughly half the window for in-flight
@@ -169,15 +190,17 @@ func NewAgent(prov provider.Provider, root, goal string, maxIterations int) *Age
 		root = abs
 	}
 	return &Agent{
-		provider:         prov,
-		root:             root,
-		programsDir:      filepath.Join(root, "programs"),
-		reinforcementDir: filepath.Join(root, "reinforcement"),
-		goal:             goal,
-		tools:            DefaultTools,
-		contextBudget:    defaultContextBudgetTokens,
-		maxIterations:    maxIterations,
-		prevOutputs:      map[string][]byte{},
+		provider:              prov,
+		root:                  root,
+		programsDir:           filepath.Join(root, "programs"),
+		reinforcementDir:      filepath.Join(root, "reinforcement"),
+		goal:                  goal,
+		tools:                 DefaultTools,
+		contextBudget:         defaultContextBudgetTokens,
+		programTimeout:        programTimeout,
+		programMaxOutputBytes: maxProgramOutputBytes,
+		maxIterations:         maxIterations,
+		prevOutputs:           map[string][]byte{},
 	}
 }
 
@@ -202,7 +225,15 @@ type Agent struct {
 	goal             string
 	tools            []ToolDefinition
 	contextBudget    int // token ceiling for the program-output slot
-	maxIterations    int // exit after this many runIteration calls; 0 = unlimited
+
+	// Per-program execution guardrails. Defaulted from the package
+	// constants in NewAgent; carved out as fields so tests can drive
+	// short timeouts and small output caps without sleeping for minutes
+	// or generating megabytes of fixture data.
+	programTimeout        time.Duration
+	programMaxOutputBytes int
+
+	maxIterations int // exit after this many runIteration calls; 0 = unlimited
 	tracer           *Tracer
 
 	conversation    []provider.Message
@@ -1337,26 +1368,101 @@ func (a *Agent) readInactive() (map[string]struct{}, error) {
 	return set, nil
 }
 
-// programHash is a sha256 over the sorted (name, exit_code, stdout) triples
-// of one iteration's program runs. Idle detection compares hashes across
-// iterations instead of byte-comparing rendered conversations, so random
-// exploration draws don't defeat the backoff.
+// programHash is a sha256 over one iteration's program runs. Idle
+// detection compares hashes across iterations instead of byte-comparing
+// rendered conversations, so random exploration draws don't defeat the
+// backoff. The hash covers everything the agent observes in the rendered
+// row — name, status, exit code (when meaningful), truncated flag, and
+// captured output — so any visible change reaches the model rather than
+// being eaten by the backoff.
 type programHash [sha256.Size]byte
 
+// programStatus classifies how a program's run terminated. The exit code
+// is only meaningful when status == programExited; for the other statuses
+// the program either never reached a normal exit or never started at all,
+// and the header carries the cause in words.
+type programStatus uint8
+
+const (
+	// programExited: the program ran to completion. exitCode is the
+	// POSIX exit status the process returned.
+	programExited programStatus = iota
+	// programTimedOut: the program exceeded programTimeout and the
+	// harness killed its process group. exitCode is undefined.
+	programTimedOut
+	// programFailedToStart: the harness could not spawn the process
+	// (bad shebang, missing interpreter, etc.). The cause text from
+	// exec is recorded inline in the header.
+	programFailedToStart
+	// programCouldNotPrepare: the harness could not stat or chmod the
+	// program file before spawning. The cause text is recorded inline
+	// in the header.
+	programCouldNotPrepare
+)
+
 // programResult captures everything one program contributed to this
-// iteration: its name, its exit code (a status channel separate from stdout
-// per the program contract), the captured combined stdout+stderr bytes,
-// and the wall-clock time the run took. Latency feeds the per-program
-// latency EWMA in stats.
+// iteration: its name, how the run terminated, the (possibly truncated)
+// combined stdout+stderr bytes, and the wall-clock time the run took.
+// Latency feeds the per-program latency EWMA in stats.
+//
+// exitCode is meaningful only when status == programExited; for other
+// statuses the header renders the cause in words and exitCode is left
+// at its zero value. cause holds the inline error text used in the
+// header for programFailedToStart and programCouldNotPrepare; it is
+// empty for the other statuses. timeoutUsed records the per-program
+// timeout that triggered the kill (set only when status == programTimedOut);
+// outputCap records the size at which output was truncated (set only
+// when truncated). Both are stashed so the header reflects the actual
+// configured value rather than reading a possibly-overridden package
+// constant.
 type programResult struct {
-	name     string
-	exitCode int
-	output   []byte
-	latency  time.Duration
+	name        string
+	status      programStatus
+	exitCode    int
+	cause       string
+	output      []byte
+	truncated   bool
+	outputCap   int
+	timeoutUsed time.Duration
+	latency     time.Duration
+}
+
+// abnormal reports whether this run is one the exploration / promotion
+// logic should treat as "this needs attention" — anything that did not
+// finish as a clean zero-exit. Used in place of the older `exitCode != 0`
+// check so timeouts and spawn failures are surfaced the same way as
+// non-zero exits.
+func (r programResult) abnormal() bool {
+	return r.status != programExited || r.exitCode != 0
 }
 
 func (r programResult) header() string {
-	return fmt.Sprintf("[program=%s exit=%d]\n", r.name, r.exitCode)
+	var sb strings.Builder
+	sb.WriteString("[program=")
+	sb.WriteString(r.name)
+	switch r.status {
+	case programExited:
+		fmt.Fprintf(&sb, " exit=%d", r.exitCode)
+	case programTimedOut:
+		fmt.Fprintf(&sb, " timed out after %s; process group killed", r.timeoutUsed)
+	case programFailedToStart:
+		sb.WriteString(" failed to start")
+		if r.cause != "" {
+			sb.WriteString(": ")
+			sb.WriteString(r.cause)
+		}
+	case programCouldNotPrepare:
+		sb.WriteString(" could not be prepared")
+		if r.cause != "" {
+			sb.WriteString(": ")
+			sb.WriteString(r.cause)
+		}
+	}
+	if r.truncated {
+		fmt.Fprintf(&sb, "; output truncated at %s", formatByteCap(r.outputCap))
+	}
+	sb.WriteString("]\n")
+	return sb.String()
 }
 
 func (r programResult) rendered() string {
@@ -1374,17 +1480,31 @@ func estimateTokens(n int) int {
 	return (n + 3) / 4
 }
 
-// hashResults computes the pre-selection program hash. Exit code is part of
-// the hash so a probe flipping from 0 to non-zero with byte-identical stdout
-// is treated as an environmental change and not eaten by idle backoff.
+// hashResults computes the pre-selection program hash. The hash includes
+// every byte the agent would observe in the rendered row so any visible
+// change — exit code flipping, status flipping from exited to timed-out,
+// truncation flag flipping, output bytes changing — produces a different
+// digest. Exit code is hashed as 0 when status != programExited so a
+// status change is distinguishable from an exit-code change even when
+// the captured bytes are identical.
 func hashResults(results []programResult) programHash {
 	h := sha256.New()
 	var buf [4]byte
 	for _, r := range results {
 		h.Write([]byte(r.name))
 		h.Write([]byte{0})
-		binary.LittleEndian.PutUint32(buf[:], uint32(r.exitCode))
+		h.Write([]byte{byte(r.status)})
+		exit := uint32(0)
+		if r.status == programExited {
+			exit = uint32(r.exitCode)
+		}
+		binary.LittleEndian.PutUint32(buf[:], exit)
 		h.Write(buf[:])
+		if r.truncated {
+			h.Write([]byte{1})
+		} else {
+			h.Write([]byte{0})
+		}
 		h.Write(r.output)
 		h.Write([]byte{0})
 	}
@@ -1652,31 +1772,32 @@ func packLexWithSentinels(results []programResult, budget int) ([]provider.TextC
 }
 
 // packExploration fills the exploration budget in two phases. Phase 1
-// pulls in every inactive program that exited non-zero this iteration in
-// lex order — this is how the exit-code contract reaches previously-
-// demoted programs — with sentinels for any that individually exceed the
-// remaining budget. Phase 2 fills any leftover budget with a uniform
-// random draw from the inactive programs that exited zero so low-scoring
-// programs stay measurable. Random skips are silent: we never committed
-// to including any specific zero-exit inactive, so there's nothing to
-// sentinel.
+// pulls in every inactive program that finished abnormally this
+// iteration (non-zero exit, timed out, failed to start, could not be
+// prepared) in lex order — this is how the abnormal-result contract
+// reaches previously-demoted programs — with sentinels for any that
+// individually exceed the remaining budget. Phase 2 fills any leftover
+// budget with a uniform random draw from the inactive programs that
+// exited cleanly so low-scoring programs stay measurable. Random skips
+// are silent: we never committed to including any specific clean
+// inactive, so there's nothing to sentinel.
 func packExploration(inactive []programResult, budget int) []provider.TextContent {
-	var nonzero, zero []programResult
+	var abnormal, clean []programResult
 	for _, r := range inactive {
-		if r.exitCode != 0 {
-			nonzero = append(nonzero, r)
+		if r.abnormal() {
+			abnormal = append(abnormal, r)
 		} else {
-			zero = append(zero, r)
+			clean = append(clean, r)
 		}
 	}
 
-	contents, used := packLexWithSentinels(nonzero, budget)
-	if used >= budget || len(zero) == 0 {
+	contents, used := packLexWithSentinels(abnormal, budget)
+	if used >= budget || len(clean) == 0 {
 		return contents
 	}
 	remaining := budget - used
-	for _, i := range rand.Perm(len(zero)) {
-		r := zero[i]
+	for _, i := range rand.Perm(len(clean)) {
+		r := clean[i]
 		cost := r.renderedTokens()
 		if cost > remaining {
 			continue
@@ -1687,13 +1808,18 @@ func packExploration(inactive []programResult, budget int) []provider.TextConten
 	return contents
 }
 
-// runPrograms executes everything in programsDir concurrently and returns
-// results sorted by name. Programs run on every iteration regardless of
-// their active/inactive status — running them is essentially free and the
-// harness needs every exit code in order to decide what reaches the context.
-// A missing programs dir or a real I/O failure surfaces as an error;
-// ordinary non-zero exits are captured into the result, not treated as run
-// failures.
+// runPrograms executes everything in programsDir concurrently and
+// returns results sorted by name. Programs run on every iteration
+// regardless of their active/inactive status — running them is
+// essentially free and the harness needs every program's status in
+// order to decide what reaches the context.
+//
+// Invariant: this function returns one programResult per file in
+// programsDir, in lex order, and basically never errors. Every per-
+// program failure mode — stat/chmod refused, exec failed to start,
+// timeout, non-zero exit, output cap exceeded — is converted into a
+// result row with the appropriate status. The top-level error is
+// reserved for a harness-level fault (programsDir unreadable).
 func (a *Agent) runPrograms(ctx context.Context) ([]programResult, error) {
 	entries, err := os.ReadDir(a.programsDir)
 	if err != nil {
@@ -1710,42 +1836,219 @@ func (a *Agent) runPrograms(ctx context.Context) ([]programResult, error) {
 
 	// Programs run concurrently into indexed slots so ordering stays
 	// deterministic (sorted by filename) regardless of completion order.
+	// The errgroup is here for the concurrency cap only — no goroutine
+	// ever returns a non-nil error.
 	results := make([]programResult, len(names))
-	g, gctx := errgroup.WithContext(ctx)
+	g, _ := errgroup.WithContext(ctx)
 	g.SetLimit(maxProgramConcurrency)
 	for i, name := range names {
 		g.Go(func() error {
-			path := filepath.Join(a.programsDir, name)
-			info, statErr := os.Stat(path)
-			if statErr != nil {
-				return fmt.Errorf("stat %s: %w", name, statErr)
-			}
-			// The write tool creates files as 0644, and the agent reliably forgets
-			// to chmod +x before the next iteration. Rather than burning a turn on
-			// the fix, just set the execute bit ourselves.
-			if info.Mode()&0o111 == 0 {
-				if err := os.Chmod(path, info.Mode()|0o111); err != nil {
-					return fmt.Errorf("chmod %s: %w", name, err)
-				}
-			}
-			start := time.Now()
-			out, runErr := exec.CommandContext(gctx, path).CombinedOutput()
-			elapsed := time.Since(start)
-
-			var exitErr *exec.ExitError
-			if runErr != nil && !errors.As(runErr, &exitErr) {
-				return fmt.Errorf("running %s: %w", name, runErr)
-			}
-			exitCode := 0
-			if exitErr != nil {
-				exitCode = exitErr.ExitCode()
-			}
-			results[i] = programResult{name: name, exitCode: exitCode, output: out, latency: elapsed}
+			results[i] = a.runOneProgram(ctx, name)
 			return nil
 		})
 	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
+	_ = g.Wait()
 	return results, nil
+}
+
+// runOneProgram executes a single library program with the guardrails
+// applied: own timeout, output cap, process-group isolation, closed
+// stdin, WaitDelay grace period. The returned programResult always has
+// the program's name, a meaningful status, and a latency; the body and
+// other fields depend on the status (see programStatus docs).
+func (a *Agent) runOneProgram(parent context.Context, name string) programResult {
+	start := time.Now()
+	path := filepath.Join(a.programsDir, name)
+
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return programResult{
+			name:    name,
+			status:  programCouldNotPrepare,
+			cause:   sanitizeHeaderText(statErr.Error()),
+			latency: time.Since(start),
+		}
+	}
+	// The write tool creates files as 0644, and the agent reliably
+	// forgets to chmod +x before the next iteration. Rather than
+	// burning a turn on the fix, set the execute bit ourselves.
+	if info.Mode()&0o111 == 0 {
+		if err := os.Chmod(path, info.Mode()|0o111); err != nil {
+			return programResult{
+				name:    name,
+				status:  programCouldNotPrepare,
+				cause:   sanitizeHeaderText(err.Error()),
+				latency: time.Since(start),
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(parent, a.programTimeout)
+	defer cancel()
+
+	cap := newProgramOutputCap(a.programMaxOutputBytes)
+	cmd := exec.CommandContext(ctx, path)
+	cmd.Stdin = nil
+	cmd.Stdout = cap
+	cmd.Stderr = cap
+	// Put the program and its descendants in a fresh process group so a
+	// detached child can't survive a timeout-driven SIGKILL. Same
+	// pattern as localBashOps.Exec in tools.go.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// Short grace period for stdout/stderr to drain after the process
+	// exits; the exit status from ProcessState is authoritative.
+	cmd.WaitDelay = programWaitDelay
+
+	runErr := cmd.Run()
+	elapsed := time.Since(start)
+
+	body := cap.bytes()
+	truncated := cap.didTruncate()
+	capSize := 0
+	if truncated {
+		capSize = a.programMaxOutputBytes
+	}
+
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return programResult{
+			name:        name,
+			status:      programTimedOut,
+			output:      body,
+			truncated:   truncated,
+			outputCap:   capSize,
+			timeoutUsed: a.programTimeout,
+			latency:     elapsed,
+		}
+	}
+
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(runErr, &exitErr) {
+			// cmd.Run returns ErrWaitDelay when a pipe-holding
+			// grandchild keeps the writer open past WaitDelay; in
+			// that case ProcessState is still authoritative.
+			if errors.Is(runErr, exec.ErrWaitDelay) && cmd.ProcessState != nil {
+				return programResult{
+					name:      name,
+					status:    programExited,
+					exitCode:  cmd.ProcessState.ExitCode(),
+					output:    body,
+					truncated: truncated,
+					outputCap: capSize,
+					latency:   elapsed,
+				}
+			}
+			return programResult{
+				name:    name,
+				status:  programFailedToStart,
+				cause:   sanitizeHeaderText(runErr.Error()),
+				latency: elapsed,
+			}
+		}
+		return programResult{
+			name:      name,
+			status:    programExited,
+			exitCode:  exitErr.ExitCode(),
+			output:    body,
+			truncated: truncated,
+			outputCap: capSize,
+			latency:   elapsed,
+		}
+	}
+
+	return programResult{
+		name:      name,
+		status:    programExited,
+		exitCode:  0,
+		output:    body,
+		truncated: truncated,
+		outputCap: capSize,
+		latency:   elapsed,
+	}
+}
+
+// formatByteCap renders a byte count for the truncation marker. KB and
+// MB sizes that round cleanly get the unit-suffixed form; everything
+// else falls back to "NB". Used by programResult.header so the
+// truncation marker reflects whatever cap was actually configured.
+func formatByteCap(n int) string {
+	switch {
+	case n >= 1024*1024 && n%(1024*1024) == 0:
+		return fmt.Sprintf("%dMB", n/(1024*1024))
+	case n >= 1024 && n%1024 == 0:
+		return fmt.Sprintf("%dKB", n/1024)
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
+// sanitizeHeaderText prepares an error string for inclusion in the
+// programResult header. Newlines collapse to spaces (the header is a
+// single line) and any ']' bytes become ')' so the bracket-terminated
+// shape parses cleanly downstream. Excess whitespace at the edges is
+// trimmed.
+func sanitizeHeaderText(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "]", ")")
+	return strings.TrimSpace(s)
+}
+
+// programOutputCap is the streaming writer wired to a program's Stdout
+// and Stderr. It buffers up to maxBytes; bytes past the cap are dropped
+// on the floor and a flag is set so the result row's header can
+// advertise the truncation. Stdout and Stderr share the same writer
+// instance for ordered interleaving (matches CombinedOutput's behavior);
+// the mutex keeps Write calls atomic across the two goroutines exec
+// spawns.
+type programOutputCap struct {
+	mu        sync.Mutex
+	buf       []byte
+	maxBytes  int
+	truncated bool
+}
+
+func newProgramOutputCap(maxBytes int) *programOutputCap {
+	return &programOutputCap{maxBytes: maxBytes}
+}
+
+func (c *programOutputCap) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if remaining := c.maxBytes - len(c.buf); remaining > 0 {
+		take := len(p)
+		if take > remaining {
+			take = remaining
+			c.truncated = true
+		}
+		c.buf = append(c.buf, p[:take]...)
+	} else if len(p) > 0 {
+		c.truncated = true
+	}
+	// Always claim a full write — exec doesn't need to know we dropped
+	// bytes, and returning short writes would confuse it.
+	return len(p), nil
+}
+
+func (c *programOutputCap) bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.buf) == 0 {
+		return nil
+	}
+	out := make([]byte, len(c.buf))
+	copy(out, c.buf)
+	return out
+}
+
+func (c *programOutputCap) didTruncate() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.truncated
 }
