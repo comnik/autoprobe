@@ -201,6 +201,7 @@ func NewAgent(prov provider.Provider, root, goal string, maxIterations int) *Age
 		programMaxOutputBytes: maxProgramOutputBytes,
 		maxIterations:         maxIterations,
 		prevOutputs:           map[string][]byte{},
+		usageByModel:          map[string]provider.Usage{},
 	}
 }
 
@@ -291,11 +292,18 @@ type Agent struct {
 	// via SubscribePhaseChanges, gets a non-blocking nudge whenever phase
 	// transitions so the indicator updates without waiting for the next
 	// 1s tick.
-	phase             atomic.Uint32
-	phaseChangedCh    chan struct{}
-	totalInputTokens  atomic.Int64
-	totalOutputTokens atomic.Int64
-	toolCycles        atomic.Int64
+	phase          atomic.Uint32
+	phaseChangedCh chan struct{}
+	toolCycles     atomic.Int64
+
+	// usageByModel accumulates provider-reported token usage keyed by the
+	// model id that produced it (AssistantMessage.Model, falling back to the
+	// provider default when a provider doesn't echo it). Per-model so cost is
+	// priced at the rate of the model that actually ran, not a single global
+	// default. Mutex-guarded rather than atomic because Usage is a struct;
+	// contention is negligible (TUI reads ~1/s, the loop writes ~1/inference).
+	usageMu      sync.Mutex
+	usageByModel map[string]provider.Usage
 	lastProgramTokens atomic.Int64
 	lastDrag          atomic.Int64
 	inToolCycle       atomic.Bool
@@ -427,10 +435,56 @@ func (a *Agent) setPhase(p uint32) {
 	}
 }
 
-// TotalTokens returns cumulative provider-reported input/output tokens
-// across every Step in this run.
-func (a *Agent) TotalTokens() (in, out int) {
-	return int(a.totalInputTokens.Load()), int(a.totalOutputTokens.Load())
+// addUsage folds one message's usage into the per-model accumulator. model is
+// AssistantMessage.Model; when empty (a provider didn't echo it) it falls back
+// to the provider default so the tokens still land in a priceable bucket.
+func (a *Agent) addUsage(model string, u provider.Usage) {
+	if model == "" {
+		model = a.provider.DefaultModel()
+	}
+	a.usageMu.Lock()
+	defer a.usageMu.Unlock()
+	b := a.usageByModel[model]
+	b.InputTokens += u.InputTokens
+	b.OutputTokens += u.OutputTokens
+	b.CacheReadInputTokens += u.CacheReadInputTokens
+	b.CacheWriteInputTokens += u.CacheWriteInputTokens
+	a.usageByModel[model] = b
+}
+
+// TotalTokens returns cumulative provider-reported tokens across every Step,
+// summed over all per-model buckets. in is the TOTAL input the models
+// processed (full-price input plus both cache buckets); cached is the
+// cache-read + cache-write portion of that total; out is output tokens.
+func (a *Agent) TotalTokens() (in, cached, out int) {
+	a.usageMu.Lock()
+	defer a.usageMu.Unlock()
+	for _, u := range a.usageByModel {
+		c := u.CacheReadInputTokens + u.CacheWriteInputTokens
+		in += u.InputTokens + c
+		cached += c
+		out += u.OutputTokens
+	}
+	return in, cached, out
+}
+
+// EstimatedCost sums the dollar cost across per-model usage buckets, pricing
+// each at its own model's rate. complete is false if any bucket's model is
+// missing from pricingTable — letting the TUI refuse to print a number it
+// can't stand behind rather than silently undercounting.
+func (a *Agent) EstimatedCost() (usd float64, complete bool) {
+	a.usageMu.Lock()
+	defer a.usageMu.Unlock()
+	complete = true
+	for model, u := range a.usageByModel {
+		p, ok := lookupPrice(a.provider.Name(), model)
+		if !ok {
+			complete = false
+			continue
+		}
+		usd += estimateCost(p, u)
+	}
+	return usd, complete
 }
 
 // ToolCycles returns the number of completed tool-calling cycles
@@ -704,8 +758,7 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 	if err != nil {
 		return provider.AssistantMessage{}, false, err
 	}
-	a.totalInputTokens.Add(int64(msg.Usage.InputTokens))
-	a.totalOutputTokens.Add(int64(msg.Usage.OutputTokens))
+	a.addUsage(msg.Model, msg.Usage)
 	if msg.StopReason == provider.StopError {
 		return msg, false, fmt.Errorf("provider error: %s", msg.Err)
 	}
@@ -883,8 +936,7 @@ func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bo
 	if err != nil {
 		return provider.AssistantMessage{}, false, err
 	}
-	a.totalInputTokens.Add(int64(msg.Usage.InputTokens))
-	a.totalOutputTokens.Add(int64(msg.Usage.OutputTokens))
+	a.addUsage(msg.Model, msg.Usage)
 	if msg.StopReason == provider.StopError {
 		return msg, false, fmt.Errorf("provider error: %s", msg.Err)
 	}

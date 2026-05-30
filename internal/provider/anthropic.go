@@ -79,8 +79,12 @@ func (p *Anthropic) Generate(ctx context.Context, model string, c Context, opts 
 	}
 
 	out := AssistantMessage{Model: string(resp.Model)}
+	// Anthropic already reports input_tokens disjoint from the cache buckets,
+	// so the fields copy straight across with no subtraction.
 	out.Usage.InputTokens = int(resp.Usage.InputTokens)
 	out.Usage.OutputTokens = int(resp.Usage.OutputTokens)
+	out.Usage.CacheReadInputTokens = int(resp.Usage.CacheReadInputTokens)
+	out.Usage.CacheWriteInputTokens = int(resp.Usage.CacheCreationInputTokens)
 
 	for _, block := range resp.Content {
 		switch block.Type {

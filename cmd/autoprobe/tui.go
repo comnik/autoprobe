@@ -343,11 +343,11 @@ func (m tuiModel) renderPhase(width int) string {
 }
 
 func (m tuiModel) renderTokens(width int) string {
-	in, out := m.agent.TotalTokens()
-	tokensCell := fmt.Sprintf("tokens   %s in  /  %s out", humanInt(in), humanInt(out))
+	in, cached, out := m.agent.TotalTokens()
+	tokensCell := fmt.Sprintf("tokens   %s in (%s cached)  /  %s out", humanInt(in), humanInt(cached), humanInt(out))
 	costCell := "est. cost   —"
-	if p, ok := lookupPrice(m.agent.Provider().Name(), m.agent.Provider().DefaultModel()); ok {
-		costCell = fmt.Sprintf("est. cost   $%.4f", estimateCost(p, in, out))
+	if usd, complete := m.agent.EstimatedCost(); complete {
+		costCell = fmt.Sprintf("est. cost   $%.4f", usd)
 	}
 	// Right-align the cost cell at the panel width.
 	pad := width - lipgloss.Width(tokensCell) - lipgloss.Width(costCell)
