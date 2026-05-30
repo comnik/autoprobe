@@ -28,7 +28,7 @@ func NewGrok(model string) *Grok {
 		option.WithBaseURL(grokBaseURL),
 	)
 	if model == "" {
-		model = "grok-4"
+		model = "grok-4.3"
 	}
 	return &Grok{client: &c, model: model}
 }
@@ -84,8 +84,14 @@ func (p *Grok) Generate(ctx context.Context, model string, c Context, opts Optio
 	}
 
 	out := AssistantMessage{Model: resp.Model}
-	out.Usage.InputTokens = int(resp.Usage.PromptTokens)
-	out.Usage.OutputTokens = int(resp.Usage.CompletionTokens)
+	// OpenAI-compatible Chat Completions folds cached tokens into
+	// prompt_tokens (subset); usageFromSubset normalizes to the disjoint
+	// invariant.
+	out.Usage = usageFromSubset(
+		int(resp.Usage.PromptTokens),
+		int(resp.Usage.CompletionTokens),
+		int(resp.Usage.PromptTokensDetails.CachedTokens),
+	)
 
 	if len(resp.Choices) == 0 {
 		out.StopReason = StopError

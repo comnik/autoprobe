@@ -26,7 +26,7 @@ type OpenAI struct {
 func NewOpenAI(model string) *OpenAI {
 	c := openai.NewClient(option.WithAPIKey(getOpenAIKey()))
 	if model == "" {
-		model = "gpt-5-codex"
+		model = "gpt-5.3-codex"
 	}
 	return &OpenAI{client: &c, model: model}
 }
@@ -91,8 +91,13 @@ func (p *OpenAI) Generate(ctx context.Context, model string, c Context, opts Opt
 	}
 
 	out := AssistantMessage{Model: string(resp.Model)}
-	out.Usage.InputTokens = int(resp.Usage.InputTokens)
-	out.Usage.OutputTokens = int(resp.Usage.OutputTokens)
+	// The Responses API folds cached tokens into input_tokens (subset);
+	// usageFromSubset normalizes to the disjoint-bucket invariant.
+	out.Usage = usageFromSubset(
+		int(resp.Usage.InputTokens),
+		int(resp.Usage.OutputTokens),
+		int(resp.Usage.InputTokensDetails.CachedTokens),
+	)
 
 	for _, item := range resp.Output {
 		switch item.Type {

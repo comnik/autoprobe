@@ -82,8 +82,15 @@ func (p *Google) Generate(ctx context.Context, model string, c Context, opts Opt
 
 	out := AssistantMessage{Model: resp.ModelVersion}
 	if resp.UsageMetadata != nil {
-		out.Usage.InputTokens = int(resp.UsageMetadata.PromptTokenCount)
-		out.Usage.OutputTokens = int(resp.UsageMetadata.CandidatesTokenCount)
+		// prompt_token_count includes cached_content_token_count (subset);
+		// usageFromSubset normalizes to the disjoint invariant. Google also
+		// bills cache storage per-token-per-hour, which can't be derived from a
+		// single response, so cache write stays 0 (a documented undercount).
+		out.Usage = usageFromSubset(
+			int(resp.UsageMetadata.PromptTokenCount),
+			int(resp.UsageMetadata.CandidatesTokenCount),
+			int(resp.UsageMetadata.CachedContentTokenCount),
+		)
 	}
 
 	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {

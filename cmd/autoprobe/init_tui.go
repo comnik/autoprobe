@@ -45,9 +45,10 @@ func suggestedModels(provider string) []modelChoice {
 	case "openai":
 		return []modelChoice{
 			{id: "", label: "(provider default)", hint: "let autoprobe pick"},
-			{id: "gpt-5-codex", label: "gpt-5-codex", hint: "code-focused reasoning"},
-			{id: "gpt-5", label: "gpt-5"},
-			{id: "o3", label: "o3"},
+			{id: "gpt-5.3-codex", label: "gpt-5.3-codex", hint: "code-focused reasoning"},
+			{id: "gpt-5.5", label: "gpt-5.5", hint: "most capable"},
+			{id: "gpt-5.4", label: "gpt-5.4"},
+			{id: "gpt-5.4-mini", label: "gpt-5.4-mini", hint: "fastest"},
 		}
 	case "google":
 		return []modelChoice{
@@ -58,9 +59,8 @@ func suggestedModels(provider string) []modelChoice {
 	case "grok":
 		return []modelChoice{
 			{id: "", label: "(provider default)", hint: "let autoprobe pick"},
-			{id: "grok-4", label: "grok-4", hint: "most capable"},
-			{id: "grok-4-fast-reasoning", label: "grok-4-fast-reasoning"},
-			{id: "grok-code-fast-1", label: "grok-code-fast-1", hint: "code-focused"},
+			{id: "grok-4.3", label: "grok-4.3", hint: "most capable"},
+			{id: "grok-build-0.1", label: "grok-build-0.1", hint: "code-focused, 256k ctx"},
 		}
 	}
 	return []modelChoice{{id: "", label: "(provider default)"}}

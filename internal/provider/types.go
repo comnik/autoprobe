@@ -117,9 +117,35 @@ const (
 )
 
 // Usage is best-effort token accounting. Providers fill what they report.
+//
+// The three input buckets are DISJOINT: InputTokens counts full-price input
+// only and EXCLUDES the two cache buckets, so cost code can price each bucket
+// independently and sum without double-counting. Providers report cache
+// tokens in two different shapes — Anthropic's input_tokens already excludes
+// the cache buckets (disjoint), while OpenAI/xAI/Google fold cached tokens
+// into their input total (subset). Each adapter normalizes to this disjoint
+// invariant at its own boundary so downstream code never has to know which
+// shape the provider used.
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
+	InputTokens           int // full-price input only — EXCLUDES the cache buckets below
+	OutputTokens          int
+	CacheReadInputTokens  int // tokens served from prompt cache (billed at a discount)
+	CacheWriteInputTokens int // tokens written to prompt cache (billed at a premium; 0 where the provider doesn't bill writes)
+}
+
+// usageFromSubset normalizes a provider that reports cached tokens as a
+// SUBSET of its input total (OpenAI, xAI, Google) into the disjoint-bucket
+// invariant: InputTokens becomes the non-cached remainder and
+// CacheReadInputTokens holds the cached count. These providers cache
+// automatically with no write surcharge, so CacheWriteInputTokens stays 0.
+// (Anthropic reports input disjoint already and copies fields directly,
+// bypassing this helper.)
+func usageFromSubset(totalInput, output, cachedRead int) Usage {
+	return Usage{
+		InputTokens:          totalInput - cachedRead,
+		OutputTokens:         output,
+		CacheReadInputTokens: cachedRead,
+	}
 }
 
 // ToolDefinition is the schema view of a tool that providers translate into

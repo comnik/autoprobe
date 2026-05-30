@@ -1,5 +1,5 @@
 .autoprobe/**
 .autoprobe-last-run/
-autoprobe
+/autoprobe
 
 evals/traces/**
