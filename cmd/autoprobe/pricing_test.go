@@ -8,8 +8,8 @@ import (
 )
 
 func TestEstimateCost(t *testing.T) {
-	// Opus 4.7 schedule: $5 in / $25 out / $0.50 cache-read / $6.25 cache-write.
-	p := modelPrice{inputPerMTok: 5.0, outputPerMTok: 25.0, cacheReadPerMTok: 0.50, cacheWritePerMTok: 6.25}
+	// Opus 4.7 schedule: $5 in / $25 out / $0.50 cache-read / $6.25 5m-write / $10 1h-write.
+	p := modelPrice{inputPerMTok: 5.0, outputPerMTok: 25.0, cacheReadPerMTok: 0.50, cacheWrite5mPerMTok: 6.25, cacheWrite1hPerMTok: 10.0}
 	const eps = 1e-9
 	cases := []struct {
 		name string
@@ -19,12 +19,13 @@ func TestEstimateCost(t *testing.T) {
 		{"input only", provider.Usage{InputTokens: 1_000_000}, 5.0},
 		{"output only", provider.Usage{OutputTokens: 1_000_000}, 25.0},
 		{"cache read discount", provider.Usage{CacheReadInputTokens: 1_000_000}, 0.50},
-		{"cache write premium", provider.Usage{CacheWriteInputTokens: 1_000_000}, 6.25},
+		{"cache write 5m premium", provider.Usage{CacheWrite5mInputTokens: 1_000_000}, 6.25},
+		{"cache write 1h premium", provider.Usage{CacheWrite1hInputTokens: 1_000_000}, 10.0},
 		{
-			// All four buckets priced independently and summed.
+			// Every bucket priced independently and summed.
 			"mixed",
-			provider.Usage{InputTokens: 200_000, OutputTokens: 100_000, CacheReadInputTokens: 800_000, CacheWriteInputTokens: 50_000},
-			200_000*5.0/1e6 + 100_000*25.0/1e6 + 800_000*0.50/1e6 + 50_000*6.25/1e6,
+			provider.Usage{InputTokens: 200_000, OutputTokens: 100_000, CacheReadInputTokens: 800_000, CacheWrite5mInputTokens: 50_000, CacheWrite1hInputTokens: 30_000},
+			200_000*5.0/1e6 + 100_000*25.0/1e6 + 800_000*0.50/1e6 + 50_000*6.25/1e6 + 30_000*10.0/1e6,
 		},
 		{"zero", provider.Usage{}, 0},
 	}
@@ -50,9 +51,14 @@ func TestEstimateCostCacheReadIsDiscounted(t *testing.T) {
 	if cached >= full {
 		t.Errorf("cache read cost %v should be cheaper than full input %v", cached, full)
 	}
-	write := estimateCost(p, provider.Usage{CacheWriteInputTokens: 1_000_000})
-	if write <= full {
-		t.Errorf("cache write cost %v should be pricier than full input %v", write, full)
+	write5m := estimateCost(p, provider.Usage{CacheWrite5mInputTokens: 1_000_000})
+	if write5m <= full {
+		t.Errorf("5m cache write cost %v should be pricier than full input %v", write5m, full)
+	}
+	// The 1-hour TTL costs more to write than the 5-minute TTL (2x vs 1.25x).
+	write1h := estimateCost(p, provider.Usage{CacheWrite1hInputTokens: 1_000_000})
+	if write1h <= write5m {
+		t.Errorf("1h cache write cost %v should be pricier than 5m %v", write1h, write5m)
 	}
 }
 

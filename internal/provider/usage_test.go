@@ -33,12 +33,12 @@ func TestUsageFromSubset(t *testing.T) {
 				t.Errorf("OutputTokens = %d, want %d", u.OutputTokens, tc.output)
 			}
 			// Subset providers never carry a cache-write charge.
-			if u.CacheWriteInputTokens != 0 {
-				t.Errorf("CacheWriteInputTokens = %d, want 0", u.CacheWriteInputTokens)
+			if u.CacheWrite5mInputTokens != 0 || u.CacheWrite1hInputTokens != 0 {
+				t.Errorf("cache writes = %d/%d, want 0/0", u.CacheWrite5mInputTokens, u.CacheWrite1hInputTokens)
 			}
 			// Disjoint invariant: full-price input + cache buckets == the
 			// provider's reported input total.
-			if got := u.InputTokens + u.CacheReadInputTokens + u.CacheWriteInputTokens; got != tc.totalInput {
+			if got := u.InputTokens + u.CacheReadInputTokens + u.CacheWrite5mInputTokens + u.CacheWrite1hInputTokens; got != tc.totalInput {
 				t.Errorf("buckets sum to %d, want %d (provider's input total)", got, tc.totalInput)
 			}
 		})

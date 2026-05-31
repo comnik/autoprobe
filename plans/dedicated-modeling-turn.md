@@ -369,6 +369,17 @@ correctly to an operator watching the dashboard.
 
 ### Prompt caching
 
+**[implemented]** All four breakpoints below are placed by the Anthropic
+provider (`internal/provider/anthropic.go`), gated on `Context.Cache`: work
+mode passes `CacheTTL5m`, modeling mode `CacheTTL1h` (set at the two
+`provider.Context` construction sites in `agent.go`). Breakpoint 3 is driven
+by `TextContent.CacheBreakpoint`, which `assembleUserMessage` flags on the
+last program-output block. Cache writes are tracked per TTL
+(`Usage.CacheWrite5mInputTokens` / `CacheWrite1hInputTokens`) so the 1-hour
+modeling writes are priced at 2x rather than the 5-minute 1.25x — see
+`pricing.go`. The other providers ignore `Context.Cache` and rely on implicit
+prefix matching, as below.
+
 The natural worry about alternating modes is cache thrashing: if work and
 modeling turns invalidate each other's prefixes, we pay full input cost on
 every iteration. They don't, because the two modes are not flipping one
@@ -414,6 +425,28 @@ Four breakpoints, ordered by stability (most stable first):
    turns); the rolling breakpoint is less load-bearing for them but
    costs nothing to include.
 
+   **[implemented]** The breakpoint attaches to the *last block of the
+   last message*, recomputed per request (`buildAnthropicMessages` in
+   `anthropic.go`), and uses the cheap 5-minute TTL — it moves every turn,
+   so an extended TTL would pay a higher write cost without being re-hit.
+   Two mechanics are worth recording:
+   - **Block type, not role, is what's special-cased.** `cache_control`
+     is rejected on thinking / redacted-thinking blocks, so when the
+     trailing block is one of those the rolling breakpoint is *skipped
+     entirely* — it does not fall back to an earlier block (the earlier
+     breakpoints still hit). The handler keys on block variant
+     (`text` / `tool_result` / `tool_use` are eligible), not on
+     user-vs-assistant role; role is irrelevant to the cache, which
+     matches byte prefixes.
+   - **In practice the last message is always user-role**, so the skip
+     almost never fires: each request ends with either the leading
+     program-output `userMsg` (fresh cycle) or a coalesced `tool_result`
+     message (mid-cycle), because a closed cycle resets history rather
+     than replaying a trailing assistant message. Placing the breakpoint
+     on this last block is also the economically correct spot for a
+     rolling breakpoint — caching the newest tail (write 1.25x once, read
+     0.1x thereafter) is cheaper than deferring it a turn.
+
 #### TTL choice differs by mode
 
 - **Work-mode system prompt: default 5-minute ephemeral.** Work cycles
@@ -428,6 +461,22 @@ Four breakpoints, ordered by stability (most stable first):
   many subsequent modeling turns within the hour. This applies only to
   the system prompt block; the user-message portion changes every
   modeling turn and should not be cached at extended TTL.
+
+**[implemented]** Because the two write tiers bill differently (5m at
+1.25x input, 1h at 2x), cost tracking splits the write bucket by TTL
+(`Usage.CacheWrite5mInputTokens` / `CacheWrite1hInputTokens`, read from
+Anthropic's `cache_creation.ephemeral_{5m,1h}_input_tokens`) and prices
+each at its own rate in `pricing.go`. Without the split, the 1-hour
+modeling writes would be priced at the 5-minute rate and undercount by
+~37%. This is the difference between cache-*aware* and cache-*accurate*
+accounting.
+
+**[open assumption]** The 1-hour modeling TTL is justified only if
+modeling turns can fire more than 5 minutes apart. If telemetry shows
+they consistently follow closely behind a work cycle, the 1-hour tier is
+paying 2x for longevity we don't use, and the simpler choice is 5m for
+all four breakpoints (pricing then stays exact with no split needed).
+Revisit once cache-hit / write-tier telemetry is available.
 
 #### Failure modes to engineer against
 
@@ -523,6 +572,18 @@ of held in tension *within* turns. Everything else follows from that.
   cornerstone into `programs/`; `programs/` starts empty (or with the
   inline `--goal` probe). The first run picks up the bootstrap trigger
   naturally.
+- `internal/provider/types.go` — add `Context.Cache` (`CacheConfig` with
+  `Enabled` + per-mode `SystemTTL`), `TextContent.CacheBreakpoint` for the
+  breakpoint-3 marker, and split `Usage` cache-write accounting into 5m/1h
+  buckets.
+- `internal/provider/anthropic.go` — place all four breakpoints when
+  `Context.Cache.Enabled`; read both `cache_creation.ephemeral_*` write
+  tiers into the split `Usage` buckets. Other providers ignore the field.
+- `agent.go` — set `Cache` at the two `provider.Context` sites (work 5m,
+  modeling 1h); flag breakpoint 3 on the last program-output block in
+  `assembleUserMessage`; accumulate both write buckets in `addUsage`.
+- `pricing.go` — add the 1-hour write rate (`cacheWrite1hPerMTok`, 2x
+  input) alongside the 5-minute rate; price both write buckets.
 - `docs/designs/dedicated-modeling-turn.md` — this document.
 
 ## Open questions

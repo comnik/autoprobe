@@ -6,14 +6,17 @@ import (
 	"github.com/comnik/autoprobe/internal/provider"
 )
 
-// modelPrice is per-million-token USD pricing for a single model id. All four
+// modelPrice is per-million-token USD pricing for a single model id. All
 // rates are full per-MTok prices (not multipliers); estimateCost prices each
-// disjoint Usage bucket against its rate and sums.
+// disjoint Usage bucket against its rate and sums. Cache writes split by TTL
+// because Anthropic bills the two tiers differently (5m at 1.25x input, 1h at
+// 2x); providers without a write surcharge leave both write rates 0.
 type modelPrice struct {
-	inputPerMTok      float64
-	outputPerMTok     float64
-	cacheReadPerMTok  float64 // prompt-cache hits; typically 0.1x input
-	cacheWritePerMTok float64 // prompt-cache writes; 0 where the provider doesn't bill writes
+	inputPerMTok        float64
+	outputPerMTok       float64
+	cacheReadPerMTok    float64 // prompt-cache hits; typically 0.1x input
+	cacheWrite5mPerMTok float64 // 5-minute-TTL writes; 0 where the provider doesn't bill writes
+	cacheWrite1hPerMTok float64 // 1-hour-TTL writes; 0 where the provider doesn't bill writes
 }
 
 // pricingTable is hand-maintained — there is no official machine-readable
@@ -30,7 +33,8 @@ type modelPrice struct {
 //
 // Rates are transcribed from each provider's canonical pricing page (verified
 // 2026-05-31). Per-provider notes and documented gaps:
-//   - Anthropic: rates + 5-minute-TTL cache schedule from the pricing docs.
+//   - Anthropic: rates + both cache-write tiers (5m at 1.25x input, 1h at
+//     2x) and the 0.1x cache-read rate, from the pricing docs.
 //   - Google: Gemini 2.5 standard (≤200K) input/output/cache-read. Gemini Pro
 //     has a >200K surcharge ($1.25→$2.50 in, $10→$15 out) that the flat
 //     prefix rate ignores, so long-context Pro runs UNDERCOUNT; cache storage
@@ -49,18 +53,18 @@ var pricingTable = []struct {
 	prefix   string
 	price    modelPrice
 }{
-	// inputPerMTok, outputPerMTok, cacheReadPerMTok, cacheWritePerMTok
-	{"anthropic", "claude-opus-4", modelPrice{5.0, 25.0, 0.50, 6.25}},
-	{"anthropic", "claude-sonnet-4", modelPrice{3.0, 15.0, 0.30, 3.75}},
-	{"anthropic", "claude-haiku-4", modelPrice{1.0, 5.0, 0.10, 1.25}},
-	{"google", "gemini-2.5-pro", modelPrice{1.25, 10.0, 0.125, 0}},
-	{"google", "gemini-2.5-flash", modelPrice{0.30, 2.50, 0.03, 0}},
-	{"openai", "gpt-5.3-codex", modelPrice{1.75, 14.0, 0.175, 0}},
-	{"openai", "gpt-5.5", modelPrice{5.0, 30.0, 0.50, 0}},
-	{"openai", "gpt-5.4-mini", modelPrice{0.75, 4.50, 0.075, 0}}, // before gpt-5.4
-	{"openai", "gpt-5.4", modelPrice{2.50, 15.0, 0.25, 0}},
-	{"grok", "grok-4.3", modelPrice{1.25, 2.50, 1.25, 0}}, // cache read = input (xAI publishes no discount)
-	{"grok", "grok-build-0.1", modelPrice{1.00, 2.00, 1.00, 0}},
+	// inputPerMTok, outputPerMTok, cacheReadPerMTok, cacheWrite5mPerMTok, cacheWrite1hPerMTok
+	{"anthropic", "claude-opus-4", modelPrice{5.0, 25.0, 0.50, 6.25, 10.0}},
+	{"anthropic", "claude-sonnet-4", modelPrice{3.0, 15.0, 0.30, 3.75, 6.0}},
+	{"anthropic", "claude-haiku-4", modelPrice{1.0, 5.0, 0.10, 1.25, 2.0}},
+	{"google", "gemini-2.5-pro", modelPrice{1.25, 10.0, 0.125, 0, 0}},
+	{"google", "gemini-2.5-flash", modelPrice{0.30, 2.50, 0.03, 0, 0}},
+	{"openai", "gpt-5.3-codex", modelPrice{1.75, 14.0, 0.175, 0, 0}},
+	{"openai", "gpt-5.5", modelPrice{5.0, 30.0, 0.50, 0, 0}},
+	{"openai", "gpt-5.4-mini", modelPrice{0.75, 4.50, 0.075, 0, 0}}, // before gpt-5.4
+	{"openai", "gpt-5.4", modelPrice{2.50, 15.0, 0.25, 0, 0}},
+	{"grok", "grok-4.3", modelPrice{1.25, 2.50, 1.25, 0, 0}}, // cache read = input (xAI publishes no discount)
+	{"grok", "grok-build-0.1", modelPrice{1.00, 2.00, 1.00, 0, 0}},
 }
 
 // lookupPrice returns the per-million-token price entry for a given
@@ -75,11 +79,12 @@ func lookupPrice(providerName, model string) (modelPrice, bool) {
 }
 
 // estimateCost computes the dollar cost for one model's usage, pricing each
-// disjoint bucket (full-price input, output, cache read, cache write) against
-// its rate and summing.
+// disjoint bucket (full-price input, output, cache read, and the two cache-
+// write tiers) against its rate and summing.
 func estimateCost(p modelPrice, u provider.Usage) float64 {
 	return (float64(u.InputTokens)*p.inputPerMTok +
 		float64(u.OutputTokens)*p.outputPerMTok +
 		float64(u.CacheReadInputTokens)*p.cacheReadPerMTok +
-		float64(u.CacheWriteInputTokens)*p.cacheWritePerMTok) / 1_000_000
+		float64(u.CacheWrite5mInputTokens)*p.cacheWrite5mPerMTok +
+		float64(u.CacheWrite1hInputTokens)*p.cacheWrite1hPerMTok) / 1_000_000
 }

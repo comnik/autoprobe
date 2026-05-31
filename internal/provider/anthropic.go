@@ -53,7 +53,13 @@ func (p *Anthropic) Generate(ctx context.Context, model string, c Context, opts 
 		}
 	}
 
-	messages, err := buildAnthropicMessages(c.Messages)
+	// Breakpoint 1: end of the tool list. Tools are identical across work and
+	// modeling modes, so this prefix caches once and is reused by both.
+	if c.Cache.Enabled && len(tools) > 0 {
+		tools[len(tools)-1].OfTool.CacheControl = ephemeralCache(CacheTTL5m)
+	}
+
+	messages, err := buildAnthropicMessages(c.Messages, c.Cache.Enabled)
 	if err != nil {
 		return AssistantMessage{}, err
 	}
@@ -70,7 +76,13 @@ func (p *Anthropic) Generate(ctx context.Context, model string, c Context, opts 
 		Tools:     tools,
 	}
 	if c.SystemPrompt != "" {
-		params.System = []anthropic.TextBlockParam{{Text: c.SystemPrompt}}
+		sys := anthropic.TextBlockParam{Text: c.SystemPrompt}
+		// Breakpoint 2: end of the (mode-specific) system prompt, at the
+		// caller's chosen TTL — 5m for work, 1h for modeling.
+		if c.Cache.Enabled {
+			sys.CacheControl = ephemeralCache(c.Cache.SystemTTL)
+		}
+		params.System = []anthropic.TextBlockParam{sys}
 	}
 
 	resp, err := p.client.Messages.New(ctx, params)
@@ -84,7 +96,10 @@ func (p *Anthropic) Generate(ctx context.Context, model string, c Context, opts 
 	out.Usage.InputTokens = int(resp.Usage.InputTokens)
 	out.Usage.OutputTokens = int(resp.Usage.OutputTokens)
 	out.Usage.CacheReadInputTokens = int(resp.Usage.CacheReadInputTokens)
-	out.Usage.CacheWriteInputTokens = int(resp.Usage.CacheCreationInputTokens)
+	// cache_creation breaks the write total down by TTL so each portion can be
+	// priced at its own premium (5m at 1.25x, 1h at 2x).
+	out.Usage.CacheWrite5mInputTokens = int(resp.Usage.CacheCreation.Ephemeral5mInputTokens)
+	out.Usage.CacheWrite1hInputTokens = int(resp.Usage.CacheCreation.Ephemeral1hInputTokens)
 
 	for _, block := range resp.Content {
 		switch block.Type {
@@ -123,11 +138,44 @@ func (p *Anthropic) Generate(ctx context.Context, model string, c Context, opts 
 	return out, nil
 }
 
+// ephemeralCache builds an ephemeral cache_control value at the given TTL.
+func ephemeralCache(ttl CacheTTL) anthropic.CacheControlEphemeralParam {
+	cc := anthropic.NewCacheControlEphemeralParam()
+	if ttl == CacheTTL1h {
+		cc.TTL = anthropic.CacheControlEphemeralTTLTTL1h
+	} else {
+		cc.TTL = anthropic.CacheControlEphemeralTTLTTL5m
+	}
+	return cc
+}
+
+// setBlockCacheControl draws a cache breakpoint after b, on whichever block
+// variant it holds. cache_control is rejected on thinking blocks, so those
+// are skipped — when the rolling breakpoint would land on a trailing
+// thinking block it simply isn't placed (the earlier breakpoints still hit).
+func setBlockCacheControl(b *anthropic.ContentBlockParamUnion, ttl CacheTTL) {
+	cc := ephemeralCache(ttl)
+	switch {
+	case b.OfText != nil:
+		b.OfText.CacheControl = cc
+	case b.OfToolResult != nil:
+		b.OfToolResult.CacheControl = cc
+	case b.OfToolUse != nil:
+		b.OfToolUse.CacheControl = cc
+	}
+}
+
 // buildAnthropicMessages translates the neutral conversation into Anthropic
 // MessageParams. Consecutive ToolResultMessages are coalesced into a single
 // user-role message with multiple tool_result blocks, matching what the API
 // expects.
-func buildAnthropicMessages(msgs []Message) ([]anthropic.MessageParam, error) {
+//
+// When cache is set, two breakpoints are placed: breakpoint 3 after any
+// UserMessage block flagged CacheBreakpoint (the byte-stable program-output
+// prefix), and breakpoint 4 — rolling — after the final block of the last
+// message, so each accumulating tool-use turn within a cycle hits cache at
+// full prior depth.
+func buildAnthropicMessages(msgs []Message, cache bool) ([]anthropic.MessageParam, error) {
 	var out []anthropic.MessageParam
 
 	for i := 0; i < len(msgs); i++ {
@@ -135,7 +183,11 @@ func buildAnthropicMessages(msgs []Message) ([]anthropic.MessageParam, error) {
 		case UserMessage:
 			blocks := make([]anthropic.ContentBlockParamUnion, 0, len(m.Content))
 			for _, c := range m.Content {
-				blocks = append(blocks, anthropic.NewTextBlock(c.Text))
+				b := anthropic.NewTextBlock(c.Text)
+				if cache && c.CacheBreakpoint {
+					b.OfText.CacheControl = ephemeralCache(CacheTTL5m)
+				}
+				blocks = append(blocks, b)
 			}
 			out = append(out, anthropic.NewUserMessage(blocks...))
 
@@ -183,6 +235,15 @@ func buildAnthropicMessages(msgs []Message) ([]anthropic.MessageParam, error) {
 
 		default:
 			return nil, fmt.Errorf("unsupported message type %T", m)
+		}
+	}
+
+	// Breakpoint 4: rolling, at the very end of the message history. Default
+	// 5-minute TTL — this line moves every turn, so an extended TTL would
+	// just pay the write cost without being re-hit.
+	if cache && len(out) > 0 {
+		if last := out[len(out)-1].Content; len(last) > 0 {
+			setBlockCacheControl(&last[len(last)-1], CacheTTL5m)
 		}
 	}
 
