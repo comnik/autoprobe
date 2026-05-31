@@ -34,7 +34,7 @@ func TestAddUsagePerModel(t *testing.T) {
 	// Two distinct models in one run — cost must price each at its own rate,
 	// not a single global default.
 	a.addUsage("claude-opus-4-7", provider.Usage{InputTokens: 100, OutputTokens: 50, CacheReadInputTokens: 10})
-	a.addUsage("claude-opus-4-7", provider.Usage{InputTokens: 100, OutputTokens: 50, CacheWriteInputTokens: 20})
+	a.addUsage("claude-opus-4-7", provider.Usage{InputTokens: 100, OutputTokens: 50, CacheWrite5mInputTokens: 20})
 	a.addUsage("claude-haiku-4-5", provider.Usage{InputTokens: 1000, OutputTokens: 200})
 
 	in, cached, out := a.TotalTokens()
@@ -55,7 +55,7 @@ func TestAddUsagePerModel(t *testing.T) {
 	}
 	opus, _ := lookupPrice("anthropic", "claude-opus-4-7")
 	haiku, _ := lookupPrice("anthropic", "claude-haiku-4-5")
-	want := estimateCost(opus, provider.Usage{InputTokens: 200, OutputTokens: 100, CacheReadInputTokens: 10, CacheWriteInputTokens: 20}) +
+	want := estimateCost(opus, provider.Usage{InputTokens: 200, OutputTokens: 100, CacheReadInputTokens: 10, CacheWrite5mInputTokens: 20}) +
 		estimateCost(haiku, provider.Usage{InputTokens: 1000, OutputTokens: 200})
 	if math.Abs(usd-want) > 1e-9 {
 		t.Errorf("EstimatedCost = %v, want %v", usd, want)

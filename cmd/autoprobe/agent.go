@@ -448,7 +448,8 @@ func (a *Agent) addUsage(model string, u provider.Usage) {
 	b.InputTokens += u.InputTokens
 	b.OutputTokens += u.OutputTokens
 	b.CacheReadInputTokens += u.CacheReadInputTokens
-	b.CacheWriteInputTokens += u.CacheWriteInputTokens
+	b.CacheWrite5mInputTokens += u.CacheWrite5mInputTokens
+	b.CacheWrite1hInputTokens += u.CacheWrite1hInputTokens
 	a.usageByModel[model] = b
 }
 
@@ -460,7 +461,7 @@ func (a *Agent) TotalTokens() (in, cached, out int) {
 	a.usageMu.Lock()
 	defer a.usageMu.Unlock()
 	for _, u := range a.usageByModel {
-		c := u.CacheReadInputTokens + u.CacheWriteInputTokens
+		c := u.CacheReadInputTokens + u.CacheWrite5mInputTokens + u.CacheWrite1hInputTokens
 		in += u.InputTokens + c
 		cached += c
 		out += u.OutputTokens
@@ -752,6 +753,9 @@ func (a *Agent) stepWork(ctx context.Context) (provider.AssistantMessage, bool, 
 		SystemPrompt: a.workSystemPrompt,
 		Messages:     a.conversation,
 		Tools:        a.toolSchemas(),
+		// Work cycles fire well under 5 minutes apart, so the default
+		// 5-minute system TTL stays permanently warm via refresh-on-hit.
+		Cache: provider.CacheConfig{Enabled: true, SystemTTL: provider.CacheTTL5m},
 	}
 	a.setPhase(PhaseInference)
 	msg, err := a.provider.Generate(ctx, "", sent, provider.Options{MaxTokens: 8192})
@@ -930,6 +934,9 @@ func (a *Agent) stepModeling(ctx context.Context) (provider.AssistantMessage, bo
 		SystemPrompt: a.modelingSystemPrompt,
 		Messages:     a.conversation,
 		Tools:        a.toolSchemas(),
+		// Modeling turns can fire more than 5 minutes apart, so the 1-hour
+		// system TTL avoids re-paying the write cost between turns.
+		Cache: provider.CacheConfig{Enabled: true, SystemTTL: provider.CacheTTL1h},
 	}
 	a.setPhase(PhaseInference)
 	msg, err := a.provider.Generate(ctx, "", sent, provider.Options{MaxTokens: 8192})
@@ -1767,6 +1774,9 @@ func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt bool) pr
 		for _, r := range d.results {
 			contents = append(contents, provider.TextContent{Text: r.rendered()})
 		}
+		// Every program's output is in the byte-stable region, so breakpoint 3
+		// lands after the last one — before the goal and reinforcement tail.
+		markCacheBreakpoint(contents)
 	} else {
 		active, inactive := splitByActive(d.results, d.inactive)
 		activeBudget := a.contextBudget * activeBudgetPercent / 100
@@ -1774,6 +1784,10 @@ func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt bool) pr
 
 		activeContents, _ := packLexWithSentinels(active, activeBudget)
 		contents = append(contents, activeContents...)
+		// Breakpoint 3 lands at the end of the byte-stable active slice; the
+		// churning exploration tail must sit after it so it doesn't
+		// invalidate the cached program-output prefix.
+		markCacheBreakpoint(contents)
 		contents = append(contents, packExploration(inactive, explorationBudget)...)
 	}
 
@@ -1786,6 +1800,16 @@ func (a *Agent) assembleUserMessage(d iterationData, showRevisionPrompt bool) pr
 		}
 	}
 	return provider.UserMessage{Content: contents}
+}
+
+// markCacheBreakpoint flags the final block of contents as the program-output
+// cache breakpoint (breakpoint 3 in the dedicated-modeling-turn design).
+// Callers invoke it right after appending the byte-stable program-output
+// region and before any churning tail. A no-op when contents is empty.
+func markCacheBreakpoint(contents []provider.TextContent) {
+	if n := len(contents); n > 0 {
+		contents[n-1].CacheBreakpoint = true
+	}
 }
 
 // splitByActive partitions lex-sorted results into the active and inactive
